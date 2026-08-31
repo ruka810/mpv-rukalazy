@@ -1,0 +1,20 @@
+{
+  "manifest_version": 3,
+  "name": "mpv Chrome Cookie Bridge",
+  "version": "1.2.0",
+  "description": "Makes the currently signed-in Bilibili and YouTube Chrome cookies available to local mpv in memory only.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA09VC95Axv8n+o3Lx1iZhtC67JqGk2bt88HcdHZLOJziiKkkHrg9k84You0wfcBgRLphymLD0thNOrBgne+zTV7mNq0JjPlTg22tF+KyeMnZr0lbOknVozaCHF5iG6YNbI7pW7XgOHkzyXIQTf9BNEey6fzmTMCiuJYrA2sJcMiI9n1HVBk6v/mqV0uBihaDuGX1mVjl4FCnKYdwsQxYOFJI5n/6201cp2MmDqafCd5rXsY2ApOT4vlEUPUtMOCEA77g6Crrw88RSW7jNB7sT7bgt66znBeB3udvJL68wb77q7rV+Gv4WX/B6dQ2Hr/xtMAYUJIyUG6FtvwdK8t4h1QIDAQAB",
+  "permissions": ["cookies", "alarms", "nativeMessaging"],
+  "host_permissions": [
+    "https://*.bilibili.com/*",
+    "https://*.youtube.com/*",
+    "https://*.google.com/*",
+    "https://youtu.be/*",
+    "http://127.0.0.1:49814/*"
+  ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; connect-src http://127.0.0.1:49814 ws://127.0.0.1:49814"
+  },
+  "background": { "service_worker": "background.js", "type": "module" },
+  "action": { "default_title": "mpv Chrome Cookie Bridge" }
+}

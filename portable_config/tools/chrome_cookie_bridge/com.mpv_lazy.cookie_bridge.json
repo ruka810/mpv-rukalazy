@@ -1,0 +1,9 @@
+{
+  "type": "stdio",
+  "path": "E:\\mpv-lazy\\portable_config\\tools\\chrome_cookie_bridge\\publish_v13\\mpv-cookie-bridge.exe",
+  "description": "mpv Chrome Cookie Bridge (in-memory only)",
+  "name": "com.mpv_lazy.cookie_bridge",
+  "allowed_origins": [
+    "chrome-extension://gikjlcfdnjgmdbdnefmknkpndmkfdlhf/"
+  ]
+}

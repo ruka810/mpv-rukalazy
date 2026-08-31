@@ -1,0 +1,15 @@
+﻿*.exe
+*.dll
+*.onnx
+*.bin
+*.pth
+*.safetensors
+*.zip
+*.7z
+*.rar
+*.tmp
+*.log
+vs-plugins/vsmlrt-cuda/
+
+portable_config/_cache/
+test_speech.mp4

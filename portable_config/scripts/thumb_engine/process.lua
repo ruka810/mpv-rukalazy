@@ -5,6 +5,16 @@ local M = {}
 
 local state, options, os_name, winapi
 
+-- [[ TEMP-DEBUG ]] 诊断日志
+local dbg = function(...)
+	local f = io.open(os.getenv("TEMP") .. "\\thumb_dbg.log", "a")
+	if f then
+		f:write(os.date("%H:%M:%S") .. " " .. table.concat({...}, " ") .. "\n")
+		f:close()
+	end
+end
+-- [[ /TEMP-DEBUG ]]
+
 local mpv_path
 local ffmpeg_path
 local client_script = [=[
@@ -199,11 +209,16 @@ local function spawn_mpv(time)
 	table.insert(args, "--")
 	table.insert(args, path)
 
+	dbg("spawn: ytdl=" .. tostring(ytdl) .. " net=" .. tostring(state.properties["demuxer-via-network"]) .. " path=" .. tostring(path) .. " open=" .. tostring(open_filename))
+	dbg("args: " .. table.concat(args, " "))
+	dbg("HTTP_PROXY=" .. tostring(os.getenv("HTTP_PROXY")) .. " http_proxy=" .. tostring(os.getenv("http_proxy")) .. " HTTPS_PROXY=" .. tostring(os.getenv("HTTPS_PROXY")))
+
 	state.spawned = true
 	state.spawn_waiting = true
 
 	M.subprocess(args, true,
 		function(success, result)
+			dbg("subprocess done success=" .. tostring(success) .. " status=" .. tostring(result and result.status))
 			if success == false or (result.status ~= 0 and result.status ~= -2) then
 				state.spawned = false
 				state.spawn_waiting = false
@@ -267,12 +282,36 @@ local precise_cur
 local seek_period_counter = 0
 local seek_timer
 
+-- 网络流 seek 间隔（秒）。拉流式媒体（HLS/DASH/直连）每次 seek 都需要重新请求
+-- 数据段，若高频 seek 会不断打断拉流导致子进程产不出稳定帧（本地文件不受影响）。
+-- 这里对网络流做节流：两次真正发送到子进程的 seek 之间至少间隔该时长，
+-- 期间累积的最新时间在冷却结束后再发送。
+local network_seek_cooldown = 1.0
+
+-- mpv 后端是否判定为网络流
+local function mpv_is_network()
+	return state.properties and state.properties["demuxer-via-network"] == true
+end
+
+local mpv_last_seek_at = 0
+
 local function seek_mpv(fast)
 	if state.last_seek_time then
-		if precise_cur == 2 then M.run("async seek " .. state.last_seek_time .. " absolute+exact")
-		elseif precise_cur == 1 then M.run("async seek " .. state.last_seek_time .. " absolute+keyframes")
+		local now = mp.get_time()
+
+		-- 仅节流高频的快速 seek（悬停扫动的起堆来源）；精确 seek 直接放行，
+		-- 保证停住后能稳定地落到精确帧。state.last_seek_time 始终是最新目标。
+		if fast and mpv_is_network() and mpv_last_seek_at ~= 0
+			and (now - mpv_last_seek_at) < network_seek_cooldown then
+			return
+		end
+
+		mpv_last_seek_at = now
+		local target = state.last_seek_time
+		if precise_cur == 2 then M.run("async seek " .. target .. " absolute+exact")
+		elseif precise_cur == 1 then M.run("async seek " .. target .. " absolute+keyframes")
 		elseif precise_cur == 0 then
-			M.run("async seek " .. state.last_seek_time .. (fast and " absolute+keyframes" or " absolute+exact"))
+			M.run("async seek " .. target .. (fast and " absolute+keyframes" or " absolute+exact"))
 		end
 	end
 end

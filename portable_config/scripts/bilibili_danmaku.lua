@@ -62,7 +62,9 @@ local font_scale_min = 0.5
 local font_scale_max = 2
 -- Runtime-adjustable Bilibili-web-style danmaku display settings.
 local DANMAKU_FONT = 'SimHei' -- 黑体, like Bilibili web danmaku.
-local area_min, area_max = 25, 100
+local area_min, area_max = 10, 100
+-- 弹幕显示区域的档位：单击弹幕按钮循环切换并持久化。
+local AREA_STEPS = {10, 25, 50, 75, 100}
 local opacity_min, opacity_max = 20, 100
 -- 参数默认值。启动时读取 mpv 现有弹幕配置（script-opts 中
 -- bilibili_danmaku-opacity / -area / -font-size，百分比）作为初始值，
@@ -104,6 +106,8 @@ local function load_persisted()
             if num then
                 if k == 'opacity' then
                     render_opacity = math.max(opacity_min, math.min(opacity_max, math.floor(num + 0.5)))
+                elseif k == 'area' then
+                    render_area = math.max(area_min, math.min(area_max, math.floor(num + 0.5)))
                 elseif k == 'font' then
                     font_scale = math.max(font_scale_min, math.min(font_scale_max, num))
                 end
@@ -118,6 +122,7 @@ local function save_persisted()
     local f = io.open(persist_path, 'w')
     if not f then return end
     f:write('opacity=' .. tostring(math.floor(render_opacity + 0.5)) .. '\n')
+    f:write('area=' .. tostring(math.floor(render_area + 0.5)) .. '\n')
     f:write('font=' .. tostring(font_scale) .. '\n')
     f:close()
 end
@@ -676,17 +681,6 @@ local function upper_bound(events, value)
     return first
 end
 
-local function vod_video_rect()
-    local dimensions = mp.get_property_native('osd-dimensions') or {}
-    local width, height = tonumber(dimensions.w), tonumber(dimensions.h)
-    if not width or not height or width <= 0 or height <= 0 then return nil end
-    local left, right = tonumber(dimensions.ml) or 0, tonumber(dimensions.mr) or 0
-    local top, bottom = tonumber(dimensions.mt) or 0, tonumber(dimensions.mb) or 0
-    local video_width, video_height = width - left - right, height - top - bottom
-    if video_width <= 0 or video_height <= 0 then return nil end
-    return width, height, left, top, video_width, video_height
-end
-
 local function overlay_target_fps()
     local fps = mp.get_property_number('display-fps', 0) or 0
     if fps <= 0 then fps = mp.get_property_number('estimated-display-fps', 0) or 0 end
@@ -759,17 +753,19 @@ local function render_vod_overlay()
     end
 
     local now = current_vod_time(state)
-    local width, height, left, top, video_width, video_height = vod_video_rect()
-    if not now or not width then return end
+    local width, height = mp.get_osd_size()
+    if not now or not width or not height or width <= 0 or height <= 0 then return end
     update_vod_render_status(state)
 
     local stage = state.stage
-    local scale_x = video_width / stage.width
-    local scale_y = video_height / stage.height
-    -- 显示区域: keep full scale for font/outline, but map the danmaku play
-    -- field into the requested top fraction of the frame (Bilibili web style).
+    -- 弹幕场直接映射到整个窗口（B 站网页行为），而不是视频矩形：
+    -- 显示区域 100% = 整个窗口高度；字号随窗口高度缩放，窗口越大字越大。
+    local scale_x = width / stage.width
+    local scale_y = height / stage.height
+    -- 显示区域: 绝对比例，基准 100% = 整个窗口。字号与 y 坐标不随区域
+    -- 缩放，仅裁剪掉区域外（y >= area_stage_limit）的弹幕车道，因此不会重叠。
     local area_frac = math.max(area_min, math.min(area_max, render_area)) / 100
-    local y_scale_y = scale_y * area_frac
+    local area_stage_limit = stage.height * area_frac
     local start_index = lower_bound(state.events, now - state.max_duration)
     local end_index = upper_bound(state.events, now) - 1
     local events = {}
@@ -796,14 +792,18 @@ local function render_vod_overlay()
                 x, y, alignment = tonumber(event.x) or 0, tonumber(event.y) or 0, 2
             end
 
-            if alignment then
+            -- 仅渲染位于显示区域（窗口上方 area_frac 高度）内的弹幕。
+            -- 显示区域是绝对比例：100% = 整个窗口高度，不随当前值再缩放。
+            if alignment and y < area_stage_limit then
                 local color = color_to_ass(event.color)
+                -- 字号随窗口高度（scale_y）缩放，只受"字号"菜单控制，
+                -- 绝不随显示区域缩放。
                 local font_size = math.max(1, tonumber(event.font_size) or state.font_size) * font_scale
                 -- 细描边: thin black outline, re-scaled with the danmaku field.
                 local bord = math.max(1.5, font_size * scale_y * 0.04)
                 events[#events + 1] = string.format(
                     '{\\an%d\\pos(%.1f,%.1f)\\fn%s\\fs%.1f\\b1\\bord%.1f\\shad0\\3c&H000000&\\1c&H%s&\\alpha&H%02X&}%s',
-                    alignment, left + x * scale_x, top + y * y_scale_y, DANMAKU_FONT,
+                    alignment, x * scale_x, y * scale_y, DANMAKU_FONT,
                     font_size * scale_y, bord, color, alpha,
                     ass_escape_event(event.text)
                 )
@@ -1560,6 +1560,12 @@ local function start_live(room_id, source_path)
     -- existing normal danmaku alive.
     if live_state and live_state.room_id == room_id then
         live_state.source_path = source_path
+        -- `request_id` is shared with the VOD pipeline: apply_settings_to_current
+        -- calls stop_vod() (which bumps request_id) before start_live.  Without
+        -- re-syncing here, poll_live_events/process_live_event would bail on the
+        -- token mismatch and silently freeze all live event delivery, so toggling
+        -- a switch on again right after turning it off would never resume.
+        live_state.token = request_id
         return
     end
     if not utils.file_info(live_python) or not utils.file_info(live_receiver) then
@@ -1730,6 +1736,7 @@ local function menu_data()
     table.insert(items, {title = '参数设置', selectable = false, muted = true, align = 'center'})
     table.insert(items, param_menu_item('opacity', '不透明度：' .. render_opacity .. '%'))
     table.insert(items, param_menu_item('font', '字号：' .. math.floor(font_scale * 100 + 0.5) .. '%'))
+    table.insert(items, param_menu_item('area', '显示区域：' .. render_area .. '%'))
 
     return {
         type = 'bilibili-danmaku',
@@ -1749,6 +1756,33 @@ local function open_menu()
     mp.commandv('script-message-to', 'uosc', 'open-menu', utils.format_json(menu_data()))
 end
 
+-- 按 AREA_STEPS 档位增减显示区域并持久化（与"字号"菜单项行为一致）。
+local function adjust_area(delta)
+    local index
+    for i, step in ipairs(AREA_STEPS) do
+        if step == render_area then
+            index = i
+            break
+        end
+    end
+    if not index then
+        -- 当前值不在档位上（例如旧状态文件），就近吸附到最近档位。
+        local best, best_delta = 1, math.huge
+        for i, step in ipairs(AREA_STEPS) do
+            local d = math.abs(step - render_area)
+            if d < best_delta then
+                best, best_delta = i, d
+            end
+        end
+        index = best
+    end
+    index = index + (delta > 0 and 1 or -1)
+    if index < 1 then index = #AREA_STEPS end
+    if index > #AREA_STEPS then index = 1 end
+    render_area = AREA_STEPS[index]
+    mp.osd_message(string.format('弹幕显示区域：%d%%', render_area), 1.2)
+end
+
 local function menu_event(json)
     local event = utils.parse_json(json or '')
     if type(event) ~= 'table' or event.type ~= 'activate' then return end
@@ -1757,6 +1791,8 @@ local function menu_event(json)
         if event.value == 'opacity' then
             render_opacity = step_number(render_opacity, delta * opacity_step, opacity_min, opacity_max)
             mp.osd_message(string.format('弹幕不透明度：%d%%', render_opacity), 1.2)
+        elseif event.value == 'area' then
+            adjust_area(delta)
         elseif event.value == 'font' then
             font_scale = math.floor(step_number(font_scale, delta * font_scale_step, font_scale_min, font_scale_max) * 10 + 0.5) / 10
             mp.osd_message(string.format('弹幕字号：%d%%', math.floor(font_scale * 100 + 0.5)), 1.2)

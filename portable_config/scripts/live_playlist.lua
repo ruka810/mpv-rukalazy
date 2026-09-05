@@ -101,9 +101,13 @@ local function live_identity(value)
     local url = normalize_url(value)
     if not url then return nil end
 
-    local host, path, query = url:match('^https?://([^/%?#]+)([^?#]*)(%?[^#]*)?$')
+    -- Lua patterns cannot apply a quantifier to a capture group, so an
+    -- optional "(...)? " query group silently becomes a literal '?' and the
+    -- whole pattern never matches.  Match the query part separately instead.
+    local host, path = url:match('^https?://([^/%?#]+)([^?#]*)')
     host = host and host:lower() or nil
     if not host then return url end
+    local query = url:match('%?[^#]*$') or ''
 
     if host == 'live.bilibili.com' then
         local room = path:match('^/blanc/(%d+)') or path:match('^/(%d+)')
@@ -126,7 +130,7 @@ local function live_identity(value)
         if video and video ~= '' then return 'youtube:' .. video end
     end
 
-    return host .. path .. (query or '')
+    return host .. path .. query
 end
 
 local function item_key(value)
@@ -496,7 +500,7 @@ local function favorite_entries()
     return entries
 end
 
-local function abandon_pending_favorite_load(message)
+local function abandon_pending_favorite_load(message, resume)
     local pending = favorite_navigation.pending
     favorite_navigation.pending = nil
     if not pending then return end
@@ -510,6 +514,10 @@ local function abandon_pending_favorite_load(message)
     else
         leave_favorite_navigation()
     end
+    if resume and pending.resume_entry_id then
+        local index = playlist_index_by_id(pending.resume_entry_id)
+        if index ~= nil then pcall(mp.commandv, 'playlist-play-index', tostring(index)) end
+    end
     if message then mp.osd_message(message, 2) end
 end
 
@@ -517,7 +525,15 @@ local function finish_pending_favorite_load()
     local pending = favorite_navigation.pending
     if not pending or not pending.entry_id then return end
     local current = playlist_entry()
-    if not current or tostring(current.id) ~= tostring(pending.entry_id) then return end
+    if not current then return end
+    if tostring(current.id) ~= tostring(pending.entry_id) then
+        -- A different entry finished loading while the favorite was still
+        -- pending: the attempt was superseded.  Drop it without touching
+        -- whatever is playing now, otherwise pending stays set forever and
+        -- silently swallows every later favorite click.
+        abandon_pending_favorite_load(nil, false)
+        return
+    end
 
     favorite_navigation.pending = nil
     favorite_navigation.current_key = pending.key
@@ -550,12 +566,13 @@ end
 
 local function play_favorite(item)
     if not item or not item.favorite or favorite_navigation.pending then return end
-    if favorite_navigation.active and favorite_navigation.current_key == item.key then return end
+    local current = playlist_entry()
     local pending = {
         key = item.key,
         old_count = mp.get_property_number('playlist-count', 0),
         previous_key = favorite_navigation.current_key,
         previous_entry_id = favorite_navigation.temporary_entry_id,
+        resume_entry_id = current and current.id or nil,
         was_active = favorite_navigation.active,
         deadline = mp.get_time() + 5,
     }
@@ -807,11 +824,34 @@ mp.observe_property('user-data/mpv/ytdl/json-subprocess-result', 'native', funct
     mp.add_timeout(0, function() refresh_current_title(false) end)
 end)
 mp.register_event('file-loaded', function()
+    local pending = favorite_navigation.pending
+    local current = playlist_entry()
+    if pending and pending.entry_id and current
+        and tostring(current.id) == tostring(pending.entry_id) then
+        -- Mark success before the deferred finish runs so a same-tick
+        -- end-file is not mistaken for a failed load.
+        pending.loaded = true
+    end
     mp.add_timeout(0, function()
         finish_pending_favorite_load()
         cleanup_temporary_favorite_entry()
         refresh_current_title(false)
     end)
+end)
+
+mp.register_event('end-file', function(event)
+    local pending = favorite_navigation.pending
+    if not pending or not pending.entry_id or pending.loaded then return end
+    local entry_id = type(event) == 'table' and event.playlist_entry_id or nil
+    if not entry_id or tostring(entry_id) ~= tostring(pending.entry_id) then return end
+
+    -- The pending favorite entry ended before it could load (e.g. the live
+    -- room is offline and yt-dlp finds no formats).  Drop the dead entry,
+    -- restore the previous navigation state and resume what was playing
+    -- before the click.  Without this, pending stays set forever and every
+    -- later favorite click is silently ignored.
+    local failed = type(event) == 'table' and event.reason == 'error'
+    abandon_pending_favorite_load(failed and '打开收藏失败' or nil, failed)
 end)
 mp.register_event('shutdown', function()
     mp.set_property_bool(FAVORITES_ACTIVE_PROPERTY, false)

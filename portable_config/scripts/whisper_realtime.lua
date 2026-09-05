@@ -17,6 +17,15 @@ local PRE_ROLL_SECONDS = 1.0
 local KEEP_BEHIND_SECONDS = 30.0
 local KEEP_AHEAD_SECONDS = 60.0
 local JUMP_THRESHOLD_SECONDS = 2.0
+-- 直播持久采集会话参数：桥接服务维护常驻 ffmpeg 读者跟随直播边缘，每轮从
+-- 环形缓冲切出最新 LIVE_CHUNK_SECONDS 窗口，并与上一窗口重叠
+-- LIVE_OVERLAP_SECONDS，保证句子不被窗口边界切断或整段漏掉。
+local LIVE_CHUNK_SECONDS = 4.0
+local LIVE_OVERLAP_SECONDS = 1.2
+-- 刚识别完但整体已过期的短句（识别耗时大于句长）：把显示窗口延长到当前
+-- 时刻之后，保证短句不被 mpv 直接丢弃。
+local LATE_CUE_GRACE_SECONDS = 0.8
+local LATE_CUE_RESCUE_WINDOW = 10.0
 local CAPTURE_SIZE = 2 * 1024 * 1024
 local TRACK_PREFIX = 'Whisper realtime'
 -- 字幕内容始终上传到同一个固定 token 的 URL，已建立的轨道用 sub-reload 原位更新，
@@ -71,6 +80,9 @@ local state = {
     previous_secondary_sid = nil,
     previous_secondary_visibility = true,
     previous_secondary_pos = nil,
+    previous_sid = nil,
+    previous_sub_visibility = true,
+    track_mode = nil,
     error_shown = false,
     retry_after = 0,
     port = nil,
@@ -79,9 +91,9 @@ local state = {
     last_audio_fallback_key = nil,
     web_context_key = nil,
     translate_enabled = false,
+    live_persist = false,          -- 当前是否走桥接服务的持久直播采集会话
     translation_cache = {},        -- [normalized原文] = 译文   （相同原文复用）
-    translation_pending = {},      -- [原文]=true 已入队/在飞/失败不再自动重试
-    translation_queue = {},        -- FIFO 待翻译 key 列表
+    translation_pending = {},      -- [原文]=true 待翻译/在飞/失败不再自动重试
     translation_busy = false,      -- 是否有请求在飞（限流）
     translation_last_sent = 0,
     translation_retry_after = 0,
@@ -155,8 +167,14 @@ local function current_track_list()
 end
 
 local function is_generated_track(track)
-    return track and track.type == 'sub'
-        and tostring(track.title or ''):sub(1, #TRACK_PREFIX) == TRACK_PREFIX
+    if not track or track.type ~= 'sub' then return false end
+    -- 本脚本设置标题为 TRACK_PREFIX；但 mpv 用 URL 文件名(如 realtime.srt)覆盖显示标题，
+    -- 因此标题匹配不一定生效，必须同时按桥接服务的注入路径识别。
+    local title = tostring(track.title or '')
+    if title:sub(1, #TRACK_PREFIX) == TRACK_PREFIX then return true end
+    local url = tostring(track['external-filename'] or '')
+    if url:find('/subtitle/', 1, true) then return true end
+    return false
 end
 
 local function remove_generated_tracks()
@@ -196,7 +214,7 @@ local function text_similar(one, other)
     return long:find(short, 1, true) ~= nil
 end
 
-local function add_segment(segment, absolute_start)
+local function add_segment(segment, absolute_start, zh_origin)
     local text = normalize_text(segment.text)
     local relative_start = tonumber(segment.start)
     local relative_end = tonumber(segment['end'])
@@ -225,6 +243,7 @@ local function add_segment(segment, absolute_start)
                     start = old.start,
                     finish = math.max(end_time, old.finish),
                     text = merged_text, normalized = merged_text, comparable = old.comparable,
+                    zh = old.zh,
                 }
             end
             return
@@ -237,6 +256,7 @@ local function add_segment(segment, absolute_start)
                 start = old.start,
                 finish = math.max(end_time, old.finish),
                 text = merged_text, normalized = merged_text, comparable = old.comparable,
+                zh = old.zh,
             }
             return
         end
@@ -244,11 +264,19 @@ local function add_segment(segment, absolute_start)
 
     state.events[#state.events + 1] = {
         start = start_time, finish = end_time, text = text, normalized = text,
-        comparable = comparable,
+        comparable = comparable, serial = state.request_serial,
+        -- 该句来自 Whisper 判定为中文的窗口：目标语言就是 zh-CN，无需翻译。
+        zh = zh_origin or nil,
     }
 end
 
 local function prune_events(reference_time)
+    -- 直播模式不清理过期字幕（关闭直播时才由 clear_events 统一清空），
+    -- 仅保持排序稳定；事件由 add_segment 去重，规模随语速线性增长。
+    if state.live_persist then
+        table.sort(state.events, function(a, b) return a.start < b.start end)
+        return
+    end
     local kept = {}
     local lower = reference_time - KEEP_BEHIND_SECONDS
     local upper = reference_time + KEEP_AHEAD_SECONDS
@@ -271,13 +299,26 @@ end
 local function build_srt(reference_time)
     local rows = {}
     local number = 0
-    local lower = reference_time - KEEP_BEHIND_SECONDS
+    -- 直播模式不裁剪过期字幕：整场历史都保留在轨道里，直到关闭直播
+    -- （切换文件 / 关闭 Q / 退出）才清空；回拖进度条时旧字幕仍能显示。
+    local lower = state.live_persist and -math.huge or reference_time - KEEP_BEHIND_SECONDS
     local upper = reference_time + KEEP_AHEAD_SECONDS
     for _, event in ipairs(state.events) do
-        if event.finish >= lower and event.start <= upper then
+        local start_time, finish_time = event.start, event.finish
+        -- 迟到保底：本轮刚识别完、但结束时间已整体过期（识别耗时大于句长）的
+        -- 短句，把显示窗口平移/延长到当前时刻之后，避免被 mpv 直接丢弃。
+        if state.live_persist and not event.rescued
+            and event.serial == state.request_serial
+            and finish_time < reference_time
+            and finish_time > reference_time - LATE_CUE_RESCUE_WINDOW then
+            event.rescued = true
+            start_time = math.min(start_time, math.max(0, reference_time - 0.05))
+            finish_time = math.max(finish_time, reference_time + LATE_CUE_GRACE_SECONDS)
+        end
+        if finish_time >= lower and start_time <= upper then
             number = number + 1
             rows[#rows + 1] = tostring(number)
-            rows[#rows + 1] = format_srt_time(event.start) .. ' --> ' .. format_srt_time(event.finish)
+            rows[#rows + 1] = format_srt_time(start_time) .. ' --> ' .. format_srt_time(finish_time)
             rows[#rows + 1] = subtitle_text(event)
             rows[#rows + 1] = ''
         end
@@ -285,12 +326,25 @@ local function build_srt(reference_time)
     return table.concat(rows, '\r\n')
 end
 
-local function find_new_track(title, old_id)
+-- 找到刚 sub-add 注入的那条生成轨（按注入路径识别，标题可能被 mpv 改写为 URL 文件名）。
+local function find_new_track(old_id)
     for _, track in ipairs(current_track_list()) do
-        if track.type == 'sub' and track.title == title and track.id ~= old_id then
+        if track.type == 'sub' and track.id ~= old_id and is_generated_track(track) then
             return track.id
         end
     end
+end
+
+-- 是否存在"真正"的主字幕轨（非本脚本生成的轨道）。
+-- mpv 的 secondary 字幕只有在主字幕轨激活时才会渲染，因此当用户没有主字幕时，
+-- 必须把生成的 Whisper 轨道当作主字幕轨（sid）来用，否则画面上一行都不会显示。
+local function primary_sub_active()
+    for _, track in ipairs(current_track_list()) do
+        if track.type == 'sub' and track.selected and not is_generated_track(track) then
+            return true
+        end
+    end
+    return false
 end
 
 local function track_present(track_id)
@@ -323,7 +377,9 @@ end
 local function ensure_subtitle_track(subtitle_url, refresh_token)
     remove_generated_tracks()
     state.track_id = nil
-    local ok, add_error = pcall(mp.commandv, 'sub-add', subtitle_url, 'auto', TRACK_PREFIX)
+    -- 不带 flags 注入，避免 mpv 自动选中这条生成轨作为主字幕（那会导致 sid 与
+    -- secondary-sid 同时指向它，造成重复渲染）。选中动作由下方 select_track 显式决定。
+    local ok, add_error = pcall(mp.commandv, 'sub-add', subtitle_url, '', TRACK_PREFIX)
     if not ok then
         state.last_srt = nil
         msg.error('[whisper_realtime] sub-add failed: ' .. tostring(add_error))
@@ -332,7 +388,7 @@ local function ensure_subtitle_track(subtitle_url, refresh_token)
     end
     local function select_track(attempt)
         if not state.enabled or refresh_token ~= state.refresh_token then return end
-        local new_id = find_new_track(TRACK_PREFIX, nil)
+        local new_id = find_new_track(nil)
         if not new_id then
             if attempt < 40 then
                 mp.add_timeout(0.05, function() select_track(attempt + 1) end)
@@ -340,8 +396,21 @@ local function ensure_subtitle_track(subtitle_url, refresh_token)
             return
         end
         state.track_id = new_id
-        pcall(mp.set_property_number, 'secondary-sid', new_id)
-        pcall(mp.set_property_bool, 'secondary-sub-visibility', true)
+        -- 无论哪种模式都要渲染：secondary 依赖 sub-visibility 打开 + 存在主字幕轨。
+        if primary_sub_active() then
+            -- 用户已有主字幕：Whisper 作为 secondary 叠在其上方，主字幕原本选择保持不变。
+            state.track_mode = 'secondary'
+            pcall(mp.set_property, 'secondary-sid', tostring(new_id))
+            pcall(mp.set_property_bool, 'secondary-sub-visibility', true)
+            pcall(mp.set_property_bool, 'sub-visibility', true)
+        else
+            -- 没有主字幕：secondary 不会被渲染，改为直接作为主字幕轨，且清掉任何次级选择。
+            state.track_mode = 'primary'
+            pcall(mp.set_property, 'secondary-sid', 'no')
+            pcall(mp.set_property_bool, 'secondary-sub-visibility', false)
+            pcall(mp.set_property, 'sid', tostring(new_id))
+            pcall(mp.set_property_bool, 'sub-visibility', true)
+        end
     end
     select_track(0)
 end
@@ -516,26 +585,42 @@ local function translate_text(key)
     do_translate(key, 1)
 end
 
--- 收集当前 events 中尚未翻译（不在缓存、未在 pending）的原文并入队。
+-- 标记当前 events 中尚未翻译（不在缓存、未标记 pending）的原文。
+-- 中文源（Whisper 上报窗口语言为中文）直接跳过：目标语言就是简体中文，
+-- zh→zh 请求没有意义，还会占用限流通道拖慢真正的外语翻译。
 local function queue_missing_translations()
     if not state.translate_enabled then return end
     for _, event in ipairs(state.events) do
-        local key = event.normalized
-        if key and key ~= '' and not state.translation_cache[key]
-            and not state.translation_pending[key] then
-            state.translation_pending[key] = true
-            state.translation_queue[#state.translation_queue + 1] = key
+        if not event.zh then
+            local key = event.normalized
+            if key and key ~= '' and not state.translation_cache[key]
+                and not state.translation_pending[key] then
+                state.translation_pending[key] = true
+            end
         end
     end
 end
 
--- 驱动翻译队列：单飞行 + 最小间隔 + 失败冷却 + FIFO。
+-- 驱动翻译：单飞行 + 最小间隔 + 失败冷却。每轮从待翻译句中挑「离当前
+-- 播放位置最近」的一条——正在显示/即将显示的行最先出译文；历史积压
+-- 由近到远在后台逐步补齐（回拖进度条时旧句也会被陆续翻译）。
 local function pump_translation()
     if not state.translate_enabled or state.translation_busy then return end
     if mp.get_time() < state.translation_retry_after then return end
     if mp.get_time() - state.translation_last_sent < MIN_TRANSLATE_INTERVAL then return end
-    local key = table.remove(state.translation_queue, 1)
-    if key then translate_text(key) end
+    local current = now_time()
+    local best_key, best_distance
+    for _, event in ipairs(state.events) do
+        local key = event.normalized
+        if key and key ~= '' and state.translation_pending[key]
+            and not state.translation_cache[key] then
+            local distance = current and math.abs(event.start - current) or math.huge
+            if not best_key or distance < best_distance then
+                best_key, best_distance = key, distance
+            end
+        end
+    end
+    if best_key then translate_text(best_key) end
 end
 
 local function toggle_translate()
@@ -550,7 +635,9 @@ local function toggle_translate()
         queue_missing_translations()
         mp.osd_message('实时翻译已开启', 2)
     else
-        state.translation_queue = {}
+        -- 关闭时清掉待翻译标记（缓存保留，重新开启时复用）；
+        -- 在飞请求不受影响，返回后照常写入缓存。
+        state.translation_pending = {}
         mp.osd_message('实时翻译已关闭', 2)
     end
     refresh_track(now_time() or 0)
@@ -644,6 +731,9 @@ local function request_args(info, start_time, request_id)
         file_generation = state.file_generation,
         context_key = info.context_key,
         refresh_web = state.web_refresh_needed and info.page_url ~= nil and info.web_kind ~= nil or false,
+        -- 持久直播采集会话的窗口参数（桥接服务仅在直播路径使用）
+        live_chunk = LIVE_CHUNK_SECONDS,
+        live_overlap = LIVE_OVERLAP_SECONDS,
     }
     return {
         CURL, '--silent', '--show-error', '--connect-timeout', '5', '--max-time', '180',
@@ -682,6 +772,7 @@ local function send_audio(token, subtitle_start, live_anchor, info, actual_start
     state.request_serial = state.request_serial + 1
     local request_id = tostring(token) .. '-' .. tostring(state.request_serial)
     local request_file_generation = state.file_generation
+    local sent_at = mp.get_time()
     state.active_request_id = request_id
     local job_id
     job_id = mp.command_native_async({
@@ -725,8 +816,27 @@ local function send_audio(token, subtitle_start, live_anchor, info, actual_start
         state.error_shown = false
         state.retry_after = 0
         local is_live = response.is_live == true
+        local live_persist = response.live_persist == true
+        state.live_persist = live_persist
         local event_origin = subtitle_start
-        if is_live then
+        if live_persist then
+            -- 持久采集会话：桥接服务回报“窗口末尾内容抵达直播边缘”的时刻
+            -- （桥接单调时钟）。用本次请求的收发时刻把两个时钟对齐，再通过
+            -- mpv 缓存边缘（playback-time + cache-duration）映射回 mpv 时间轴：
+            -- 该内容在 edge_wall 时位于边缘，mpv 将在缓存边缘到达它时播放。
+            local current_now = now_time()
+            local t_sent = tonumber(sent_at)
+            local edge_wall = tonumber(response.edge_wall)
+            local t_recv = tonumber(response.t_recv)
+            local window_duration = tonumber(response.window_duration) or 0
+            if current_now and t_sent and edge_wall and t_recv and window_duration > 0 then
+                local edge_lua = t_sent + (edge_wall - t_recv)
+                local window_end_mpv = current_now + cache_duration() - (mp.get_time() - edge_lua)
+                event_origin = window_end_mpv - window_duration
+            else
+                event_origin = live_anchor + math.max(0, tonumber(response.capture_started_after) or 0)
+            end
+        elseif is_live then
             -- `live_anchor` points at mpv's cached live edge when the request
             -- was sent.  The bridge reports its own resolve/capture delay so
             -- newly opened HLS/FLV readers map back onto mpv's timeline.
@@ -742,11 +852,31 @@ local function send_audio(token, subtitle_start, live_anchor, info, actual_start
                 mp.osd_message('网页音轨未匹配，Whisper 使用最佳可用音频', 4)
             end
         end
-        for _, segment in ipairs(response.segments) do add_segment(segment, event_origin) end
+        -- Whisper 每轮上报整窗识别语言：窗口判定为中文时，其中的句子
+        -- 全部标记 zh，翻译阶段直接跳过（目标语言就是 zh-CN）。
+        local source_language = tostring(response.language or ''):lower()
+        local zh_origin = source_language:sub(1, 2) == 'zh'
+            or source_language:find('chin', 1, true) ~= nil
+            or source_language:find('mandarin', 1, true) ~= nil
+            or source_language:find('canton', 1, true) ~= nil
+            or source_language == 'yue'
+        for _, segment in ipairs(response.segments) do add_segment(segment, event_origin, zh_origin) end
         local current = now_time() or event_origin
         refresh_track(current)
-        state.next_start = is_live and ((now_time() or actual_start) + STEP_SECONDS)
-            or (event_origin + STEP_SECONDS)
+        if state.translate_enabled then
+            -- 新句刚入库立刻排队并泵送翻译，不等下一个 tick（省 0~0.25s）。
+            queue_missing_translations()
+            pump_translation()
+        end
+        if live_persist then
+            -- 会话内部按缓冲填充自动配速（每轮消耗 chunk-overlap 秒新音频），
+            -- Lua 侧无需步进游标，响应回来即可立刻发起下一轮。
+            state.next_start = current
+        elseif is_live then
+            state.next_start = (now_time() or actual_start) + STEP_SECONDS
+        else
+            state.next_start = event_origin + STEP_SECONDS
+        end
         if info.page_url and info.web_kind then state.web_refresh_needed = false end
         state.busy = false
     end)
@@ -917,6 +1047,15 @@ local function restore_secondary_track_state()
     if state.previous_secondary_pos ~= nil then
         pcall(mp.set_property, 'secondary-sub-pos', tostring(state.previous_secondary_pos))
     end
+    -- 若 Whisper 轨以主字幕身份在用，关闭时恢复用户原本的主字幕选择。
+    if state.track_mode == 'primary' then
+        if state.previous_sid then
+            pcall(mp.set_property, 'sid', state.previous_sid)
+        end
+    end
+    -- 两种模式都可能强制打开了 sub-visibility，统一恢复用户原值。
+    pcall(mp.set_property_bool, 'sub-visibility', state.previous_sub_visibility)
+    state.track_mode = nil
 end
 
 local function stop_server()
@@ -976,9 +1115,13 @@ local function enable()
     state.previous_secondary_sid = mp.get_property('secondary-sid')
     state.previous_secondary_visibility = mp.get_property_bool('secondary-sub-visibility', true)
     state.previous_secondary_pos = mp.get_property_number('secondary-sub-pos', 0)
-    -- The generated SRT lives on the secondary subtitle track.  Give it a
-    -- stable bottom placement for this session and restore the user's value
-    -- when Q is turned off.
+    state.previous_sid = mp.get_property('sid')
+    state.previous_sub_visibility = mp.get_property_bool('sub-visibility', true)
+    -- The generated SRT normally lives on the secondary subtitle track; when
+    -- the user has no primary subtitle though, mpv won't render a lone secondary
+    -- track, so ensure_subtitle_track switches it to the primary track instead.
+    -- Place it at the bottom of the video for this session and restore the
+    -- user's value when Q is turned off.
     pcall(mp.set_property, 'secondary-sub-pos', '100')
     reset_timeline('enable', true, true)
     start_bridge()
@@ -1000,8 +1143,15 @@ end
 local function on_playback_time(_, value)
     if not state.enabled or type(value) ~= 'number' then return end
     if state.last_time and math.abs(value - state.last_time) > JUMP_THRESHOLD_SECONDS then
-        reset_timeline('playback jump', true, true)
-        state.seek_hold_until = mp.get_time() + 0.3
+        if state.live_persist then
+            -- 直播内的跳变来自 seek / 同步到直播边缘：锚点经缓存边缘
+            -- 自校准，无需重置，保住已积累的字幕历史。
+            state.last_time = value
+            state.seek_hold_until = mp.get_time() + 0.3
+        else
+            reset_timeline('playback jump', true, true)
+            state.seek_hold_until = mp.get_time() + 0.3
+        end
     else
         state.last_time = value
     end
@@ -1011,7 +1161,11 @@ local function on_pause(_, value)
     local paused = value == true
     if paused and not state.paused then state.pause_since = os.clock() end
     if not paused and state.paused and state.pause_since and os.clock() - state.pause_since > JUMP_THRESHOLD_SECONDS then
-        reset_timeline('long pause resume', true, true)
+        -- 直播模式暂停恢复不清空字幕历史：锚点经缓存边缘自校准，
+        -- 历史保留到关闭直播（切换文件 / 关闭 Q）才清理。
+        if not state.live_persist then
+            reset_timeline('long pause resume', true, true)
+        end
     end
     state.paused = paused
     if not paused then state.pause_since = nil end
@@ -1022,7 +1176,10 @@ local function on_buffering(_, value)
     if buffering and not state.buffering then state.buffering_since = os.clock() end
     if not buffering and state.buffering and state.buffering_since
         and os.clock() - state.buffering_since > 0.75 then
-        reset_timeline('cache resume', true, true)
+        -- 直播模式瞬时缓存停顿（如同步到边缘后的补缓冲）不清空字幕历史。
+        if not state.live_persist then
+            reset_timeline('cache resume', true, true)
+        end
     end
     state.buffering = buffering
     if not buffering then state.buffering_since = nil end
@@ -1037,12 +1194,17 @@ local function on_cache_buffering(_, value)
 end
 
 local function on_seek()
-    if state.enabled then
-        -- Subtitle work is invalidated only.  It never sends an mpv seek or
-        -- touches cache/pause state, so the user's exact seek remains intact.
-        reset_timeline('seek event', true, true)
+    if not state.enabled then return end
+    if state.live_persist then
+        -- 直播下 seek（含 F5 同步到边缘）不清空字幕：锚点自校准，
+        -- 历史保留到关闭直播；拖回进度条时旧字幕照常显示。
         state.seek_hold_until = mp.get_time() + 0.3
+        return
     end
+    -- Subtitle work is invalidated only.  It never sends an mpv seek or
+    -- touches cache/pause state, so the user's exact seek remains intact.
+    reset_timeline('seek event', true, true)
+    state.seek_hold_until = mp.get_time() + 0.3
 end
 
 local function on_file_loaded()

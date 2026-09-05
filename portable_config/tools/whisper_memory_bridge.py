@@ -14,6 +14,7 @@ import json
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import threading
@@ -41,12 +42,175 @@ MAX_REQUEST_BYTES = 128 * 1024
 # empty WAV while never dropping a meaningful final chunk.
 MIN_AUDIO_BYTES = 1024
 
+# Persistent live-capture session parameters.  One long-lived ffmpeg reader
+# follows the live edge and appends 16 kHz mono PCM into an in-memory ring
+# buffer; every /transcribe request slices the newest window out of it, which
+# removes per-chunk connection setup and keeps coverage gapless.
+LIVE_SAMPLE_RATE = 16000
+LIVE_BYTES_PER_SECOND = LIVE_SAMPLE_RATE * 2
+LIVE_BUFFER_SECONDS = 90.0
+# A freshly spawned reader may need a few seconds before the first segment
+# arrives; an established reader that stops producing PCM for this long is
+# considered broken and gets respawned.
+LIVE_SPAWN_GRACE_SECONDS = 15.0
+LIVE_STALL_SECONDS = 12.0
+LIVE_IDLE_SECONDS = 120.0
+
 
 class BridgeError(RuntimeError):
     def __init__(self, message: str, stage: str = "capture", empty: bool = False) -> None:
         super().__init__(message)
         self.stage = stage
         self.empty = empty
+
+
+def wav_bytes(pcm: bytes) -> bytes:
+    """Wrap raw 16 kHz mono s16le PCM in a minimal WAV header."""
+    header = struct.pack(
+        "<4sI4s4sIHHIIHH4sI",
+        b"RIFF", 36 + len(pcm), b"WAVE", b"fmt ",
+        16, 1, 1, LIVE_SAMPLE_RATE, LIVE_BYTES_PER_SECOND, 2, 16,
+        b"data", len(pcm),
+    )
+    return header + pcm
+
+
+class LiveSession:
+    """One persistent ffmpeg reader for a live source feeding a PCM ring buffer.
+
+    The reader follows the live edge and appends decoded PCM continuously.
+    ``epochs`` records when each buffer position was produced so a sliced
+    window can report the wall time its last sample hit the live edge; that
+    timestamp is what lets the Lua side map the window back onto mpv's
+    timeline via mpv's demuxer cache end.
+    """
+
+    def __init__(self, key: str, resolved: ResolvedAudio, spawn_args: list[str]) -> None:
+        self.key = key
+        self.resolved = resolved
+        self.lock = threading.Lock()
+        self.buffer = bytearray()
+        self.base_frames = 0  # stream frame index currently at buffer[0]
+        self.total_frames = 0  # cumulative frames appended since spawn
+        self.epochs: list[tuple[int, float]] = []  # (total_frames, monotonic)
+        self.served_until = 0.0  # seconds covered by the last served window
+        self.last_append = time.monotonic()
+        self.last_used = time.monotonic()
+        self.started_at = time.monotonic()
+        self.dead = False
+        self.error = ""
+        self._stderr_tail = ""
+        self.process = subprocess.Popen(
+            spawn_args,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            **process_flags(),
+        )
+        self._stdout_thread = threading.Thread(target=self._read_stdout, daemon=True)
+        self._stderr_thread = threading.Thread(target=self._read_stderr, daemon=True)
+        self._stdout_thread.start()
+        self._stderr_thread.start()
+
+    def _read_stdout(self) -> None:
+        pending = b""
+        try:
+            while True:
+                data = self.process.stdout.read(16384)
+                if not data:
+                    break
+                data = pending + data
+                usable = len(data) - (len(data) % 2)
+                pending = data[usable:]
+                if usable <= 0:
+                    continue
+                frames = usable // 2
+                now = time.monotonic()
+                with self.lock:
+                    max_frames = int(LIVE_BUFFER_SECONDS * LIVE_SAMPLE_RATE)
+                    excess = self.total_frames - self.base_frames + frames - max_frames
+                    if excess > 0:
+                        del self.buffer[: excess * 2]
+                        self.base_frames += excess
+                        while len(self.epochs) > 2 and self.epochs[1][0] <= self.base_frames:
+                            self.epochs.pop(0)
+                    self.buffer += data[:usable]
+                    self.total_frames += frames
+                    if not self.epochs or now - self.epochs[-1][1] >= 0.05:
+                        self.epochs.append((self.total_frames, now))
+                    self.last_append = now
+        except OSError:
+            pass
+        finally:
+            try:
+                self._stderr_thread.join(timeout=2.0)
+            except RuntimeError:
+                pass
+            with self.lock:
+                if not self.dead:
+                    self.dead = True
+                    self.error = self._stderr_tail.strip()[-400:] or "live capture process exited"
+
+    def _read_stderr(self) -> None:
+        tail = b""
+        try:
+            while True:
+                chunk = self.process.stderr.read(4096)
+                if not chunk:
+                    break
+                tail = (tail + chunk)[-2000:]
+            self._stderr_tail = tail.decode("utf-8", "replace")
+        except OSError:
+            pass
+
+    def healthy(self) -> bool:
+        with self.lock:
+            if self.dead:
+                return False
+            now = time.monotonic()
+            if now - self.started_at < LIVE_SPAWN_GRACE_SECONDS:
+                return True
+            return now - self.last_append < LIVE_STALL_SECONDS
+
+    def fill_seconds(self) -> float:
+        with self.lock:
+            return self.total_frames / LIVE_SAMPLE_RATE
+
+    def slice_window(self, start: float, end: float) -> tuple[bytes, float]:
+        """Return PCM for [start, end] seconds plus the wall time of `end`."""
+        with self.lock:
+            f0 = max(self.base_frames, int(round(start * LIVE_SAMPLE_RATE)))
+            f1 = min(self.total_frames, int(round(end * LIVE_SAMPLE_RATE)))
+            if f1 <= f0:
+                return b"", 0.0
+            pcm = bytes(self.buffer[(f0 - self.base_frames) * 2 : (f1 - self.base_frames) * 2])
+            return pcm, self._wall_at_frames_locked(f1)
+
+    def _wall_at_frames_locked(self, frames: int) -> float:
+        if not self.epochs:
+            return self.last_append
+        if frames >= self.epochs[-1][0]:
+            # Past the last append: the buffer fills at real-time rate.
+            return self.epochs[-1][1] + (frames - self.epochs[-1][0]) / LIVE_SAMPLE_RATE
+        prev_frames, prev_wall = self.epochs[0]
+        for cur_frames, cur_wall in self.epochs[1:]:
+            if cur_frames >= frames:
+                if cur_frames == prev_frames:
+                    return cur_wall
+                ratio = (frames - prev_frames) / (cur_frames - prev_frames)
+                return prev_wall + (cur_wall - prev_wall) * ratio
+            prev_frames, prev_wall = cur_frames, cur_wall
+        return self.epochs[-1][1]
+
+    def kill(self) -> None:
+        with self.lock:
+            self.dead = True
+            if not self.error:
+                self.error = "session killed"
+        try:
+            self.process.kill()
+        except OSError:
+            pass
 
 
 @dataclass
@@ -170,12 +334,51 @@ def ffmpeg_path() -> str:
     return shutil.which("ffmpeg") or r"C:\Program Files\ffmpeg\bin\ffmpeg.exe"
 
 
+def ffmpeg_input_args(resolved: ResolvedAudio) -> list[str]:
+    """Shared input-side options (proxy/headers/UA/referer) for ffmpeg reads."""
+    args: list[str] = []
+    scheme = urlparse(resolved.source).scheme.lower()
+    if resolved.is_web and resolved.proxy and scheme in ("http", "https"):
+        args.extend(["-http_proxy", resolved.proxy])
+    safe_headers = []
+    for name, value in resolved.headers.items():
+        if name.lower() in ("host", "content-length", "transfer-encoding", "user-agent", "referer"):
+            continue
+        safe_headers.append(f"{name}: {value}")
+    if safe_headers:
+        args.extend(["-headers", "\r\n".join(safe_headers) + "\r\n"])
+    user_agent = header_value(resolved.headers, "user-agent")
+    referer = header_value(resolved.headers, "referer")
+    if user_agent:
+        args.extend(["-user_agent", user_agent])
+    if referer:
+        args.extend(["-referer", referer])
+    return args
+
+
 class WhisperBridge:
     def __init__(self) -> None:
         self._cache: dict[str, ResolvedAudio] = {}
         self._subtitle_cache: dict[str, str] = {}
         self._jobs: dict[str, subprocess.Popen[bytes]] = {}
+        self._live_sessions: dict[str, LiveSession] = {}
         self._lock = threading.RLock()
+        self._reaper = threading.Thread(target=self._reap_idle_sessions, daemon=True)
+        self._reaper.start()
+
+    def _reap_idle_sessions(self) -> None:
+        while True:
+            time.sleep(30.0)
+            now = time.monotonic()
+            with self._lock:
+                stale = [
+                    key for key, session in self._live_sessions.items()
+                    if now - session.last_used > LIVE_IDLE_SECONDS
+                    or (session.dead and now - session.last_used > 15.0)
+                ]
+                sessions = [self._live_sessions.pop(key) for key in stale]
+            for session in sessions:
+                session.kill()
 
     def put_subtitle(self, content: str, token: str | None = None) -> str:
         token = token or uuid.uuid4().hex
@@ -210,7 +413,13 @@ class WhisperBridge:
 
     def invalidate(self, payload: dict[str, Any]) -> None:
         with self._lock:
-            self._cache.pop(self.cache_key(payload), None)
+            key = self.cache_key(payload)
+            self._cache.pop(key, None)
+            session = self._live_sessions.pop(key, None)
+        if session is not None:
+            # The route this reader holds may be what just failed; force a
+            # fresh resolve and respawn on the next request.
+            session.kill()
 
     def cancel(self, request_id: str) -> bool:
         with self._lock:
@@ -558,22 +767,7 @@ class WhisperBridge:
         duration = min(max(number(payload.get("duration"), 6.0), 1.0), 30.0)
         map_spec = resolved.map_spec or text(payload.get("map")) or "0:a:0"
         args = [ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-rw_timeout", "15000000"]
-        scheme = urlparse(resolved.source).scheme.lower()
-        if resolved.is_web and resolved.proxy and scheme in ("http", "https"):
-            args.extend(["-http_proxy", resolved.proxy])
-        safe_headers = []
-        for name, value in resolved.headers.items():
-            if name.lower() in ("host", "content-length", "transfer-encoding", "user-agent", "referer"):
-                continue
-            safe_headers.append(f"{name}: {value}")
-        if safe_headers:
-            args.extend(["-headers", "\r\n".join(safe_headers) + "\r\n"])
-        user_agent = header_value(resolved.headers, "user-agent")
-        referer = header_value(resolved.headers, "referer")
-        if user_agent:
-            args.extend(["-user_agent", user_agent])
-        if referer:
-            args.extend(["-referer", referer])
+        args.extend(ffmpeg_input_args(resolved))
         if resolved.is_live and resolved.is_hls_live:
             args.extend(["-live_start_index", "-2"])
         capture_started = time.monotonic()
@@ -655,6 +849,104 @@ class WhisperBridge:
             raise BridgeError("Whisper returned a non-object response", "whisper")
         return data
 
+    def live_session_for(self, payload: dict[str, Any], force_fresh: bool) -> LiveSession | None:
+        """Return a healthy persistent live reader for this source, if any.
+
+        A healthy session is reused as-is (skipping yt-dlp resolution entirely)
+        because the reader already holds a working route to the same audio.
+        Returns None when the source turns out not to be live; the caller then
+        falls back to the regular per-chunk capture path.
+        """
+        key = self.cache_key(payload)
+        if not force_fresh:
+            with self._lock:
+                session = self._live_sessions.get(key)
+                if session is not None and session.healthy():
+                    return session
+        resolved = self.source_for(payload, force_fresh)
+        if not resolved.is_live:
+            return None
+        return self.spawn_live_session(key, resolved)
+
+    def spawn_live_session(self, key: str, resolved: ResolvedAudio) -> LiveSession:
+        ffmpeg = ffmpeg_path()
+        if not shutil.which(ffmpeg) and not Path(ffmpeg).is_file():
+            raise BridgeError("ffmpeg was not found", "capture")
+        args = [ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-rw_timeout", "15000000"]
+        args.extend(ffmpeg_input_args(resolved))
+        if resolved.is_hls_live:
+            # Start at the newest published segment: the reader then follows the
+            # edge continuously, so no extra back-off segments are required.
+            args.extend(["-live_start_index", "-1"])
+        args.extend([
+            "-i", resolved.source,
+            "-map", resolved.map_spec or "0:a:0",
+            "-vn", "-sn", "-dn",
+            "-ac", "1", "-ar", "16000",
+            "-c:a", "pcm_s16le", "-f", "s16le", "pipe:1",
+        ])
+        with self._lock:
+            old = self._live_sessions.get(key)
+        if old is not None:
+            old.kill()
+        session = LiveSession(key, resolved, args)
+        with self._lock:
+            self._live_sessions[key] = session
+        return session
+
+    def transcribe_live(
+        self,
+        session: LiveSession,
+        endpoint: str,
+        payload: dict[str, Any],
+        attempt_payload: dict[str, Any],
+        started: float,
+    ) -> dict[str, Any]:
+        t_recv = time.monotonic()
+        chunk = min(max(number(payload.get("live_chunk"), 4.0), 2.0), 10.0)
+        overlap = min(max(number(payload.get("live_overlap"), 1.2), 0.0), chunk / 2.0)
+        respawned = False
+        # Wait until the ring buffer holds a full new window.  The wait itself
+        # paces the request cadence: each cycle consumes (chunk - overlap)
+        # seconds of fresh audio, so coverage stays gapless.
+        while True:
+            if not session.healthy():
+                if respawned:
+                    raise BridgeError(f"live capture stopped: {session.error}", "capture")
+                resolved = self.source_for(attempt_payload, True)
+                if not resolved.is_live:
+                    raise BridgeError("live source is no longer live", "capture")
+                session = self.spawn_live_session(session.key, resolved)
+                respawned = True
+            start = max(0.0, session.served_until - overlap)
+            need_end = start + chunk
+            if session.fill_seconds() >= need_end:
+                break
+            if time.monotonic() - t_recv > 30.0:
+                raise BridgeError("live capture stalled waiting for audio", "capture")
+            time.sleep(0.08)
+        pcm, edge_wall = session.slice_window(start, min(need_end, session.fill_seconds()))
+        end = start + len(pcm) / LIVE_BYTES_PER_SECOND
+        with session.lock:
+            session.served_until = max(session.served_until, end)
+            session.last_used = time.monotonic()
+        if len(pcm) < MIN_AUDIO_BYTES:
+            raise BridgeError("live window is empty", "capture", empty=True)
+        response = self.whisper(endpoint, wav_bytes(pcm))
+        response["ok"] = True
+        response["live_persist"] = True
+        response["t_recv"] = t_recv
+        response["edge_wall"] = edge_wall
+        response["window_duration"] = end - start
+        response["capture_offset"] = t_recv - started
+        response["capture_started_after"] = t_recv - started
+        response["capture_finished_after"] = time.monotonic() - started
+        response["capture_duration"] = end - start
+        response["audio_selection"] = session.resolved.selection
+        response["web_source"] = True
+        response["is_live"] = True
+        return response
+
     def transcribe(self, payload: dict[str, Any]) -> dict[str, Any]:
         endpoint = text(payload.get("endpoint"))
         request_id = text(payload.get("request_id")) or uuid.uuid4().hex
@@ -664,12 +956,21 @@ class WhisperBridge:
         is_web = bool(text(payload.get("page_url")) and text(payload.get("web_kind")))
         force_refresh = bool(payload.get("refresh_web"))
         last_error: BridgeError | None = None
+        resolved: ResolvedAudio | None = None
         for attempt in range(2 if is_web else 1):
             try:
                 attempt_payload = dict(payload)
                 attempt_payload["route_attempt"] = attempt
                 if attempt and text(attempt_payload.get("web_kind")).startswith("bilibili-live"):
                     attempt_payload["prefer_bilibili_api"] = True
+                if is_web:
+                    # A retry after a capture/resolve failure must rebuild the
+                    # reader; after a whisper failure the existing reader is
+                    # still good and must be kept.
+                    refresh_session = attempt > 0 and last_error is not None and last_error.stage != "whisper"
+                    session = self.live_session_for(attempt_payload, refresh_session)
+                    if session is not None:
+                        return self.transcribe_live(session, endpoint, payload, attempt_payload, started)
                 resolved = self.source_for(attempt_payload, force_refresh or attempt > 0)
                 audio = self.capture_audio(resolved, attempt_payload, request_id)
                 response = self.whisper(endpoint, audio.data)
@@ -691,8 +992,8 @@ class WhisperBridge:
                     return {
                         "ok": True,
                         "segments": [],
-                        "is_live": resolved.is_live,
-                        "audio_selection": resolved.selection,
+                        "is_live": resolved.is_live if resolved is not None else True,
+                        "audio_selection": resolved.selection if resolved is not None else "live",
                         "web_source": is_web,
                         "capture_offset": 0.0,
                         "capture_started_after": 0.0,
@@ -701,7 +1002,10 @@ class WhisperBridge:
                     }
                 if not is_web or attempt:
                     break
-                self.invalidate(payload)
+                if error.stage != "whisper":
+                    # Whisper-side failures are unrelated to the resolved route;
+                    # keep any live reader alive and just retry the inference.
+                    self.invalidate(payload)
         raise last_error or BridgeError("Whisper bridge request failed", "bridge")
 
 

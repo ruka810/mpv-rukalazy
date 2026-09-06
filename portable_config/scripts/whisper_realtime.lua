@@ -22,6 +22,10 @@ local JUMP_THRESHOLD_SECONDS = 2.0
 -- LIVE_OVERLAP_SECONDS，保证句子不被窗口边界切断或整段漏掉。
 local LIVE_CHUNK_SECONDS = 4.0
 local LIVE_OVERLAP_SECONDS = 1.2
+-- 点播(VOD)预取上限：窗口游标领先播放超过该值时本轮不再发请求，等播放
+-- 推进后再继续。顺序解码会话本身整段缓冲在内存里，限制只是为了不把
+-- 用户可能永远看不到的音频提前转写成字幕（seek 后即为无效功）。
+local VOD_AHEAD_SECONDS = 12.0
 -- 刚识别完但整体已过期的短句（识别耗时大于句长）：把显示窗口延长到当前
 -- 时刻之后，保证短句不被 mpv 直接丢弃。
 local LATE_CUE_GRACE_SECONDS = 0.8
@@ -817,6 +821,7 @@ local function send_audio(token, subtitle_start, live_anchor, info, actual_start
         state.retry_after = 0
         local is_live = response.is_live == true
         local live_persist = response.live_persist == true
+        local vod_persist = response.vod_persist == true
         state.live_persist = live_persist
         local event_origin = subtitle_start
         if live_persist then
@@ -836,6 +841,11 @@ local function send_audio(token, subtitle_start, live_anchor, info, actual_start
             else
                 event_origin = live_anchor + math.max(0, tonumber(response.capture_started_after) or 0)
             end
+        elseif vod_persist then
+            -- 顺序解码会话：桥接服务按帧偏移精确切出请求窗口，窗口首样本就是
+            -- 请求的媒体时刻，无需任何偏移修正（HTTP Range seek 在这些流上不可
+            -- 靠，正是改用整段顺序解码的原因）。
+            event_origin = subtitle_start
         elseif is_live then
             -- `live_anchor` points at mpv's cached live edge when the request
             -- was sent.  The bridge reports its own resolve/capture delay so
@@ -1252,6 +1262,11 @@ local function tick()
     if not state.next_start then state.next_start = math.max(0, current - PRE_ROLL_SECONDS) end
     if current - state.next_start > STEP_SECONDS * 1.5 then
         state.next_start = math.max(0, current - PRE_ROLL_SECONDS)
+    end
+    -- 点播预取上限：窗口游标领先播放过多时本轮不发请求，等播放推进。
+    -- 直播持久会话由缓冲填充自动配速，不受此限制。
+    if not state.live_persist and state.next_start - current > VOD_AHEAD_SECONDS then
+        return
     end
 
     local chunk_start = state.next_start

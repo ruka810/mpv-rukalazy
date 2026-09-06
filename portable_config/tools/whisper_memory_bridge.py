@@ -56,12 +56,31 @@ LIVE_SPAWN_GRACE_SECONDS = 15.0
 LIVE_STALL_SECONDS = 12.0
 LIVE_IDLE_SECONDS = 120.0
 
+# Persistent VOD decode session parameters.  HTTP Range seeks on some DASH
+# m4s routes silently return a fixed wrong position regardless of the
+# requested timestamp (measured: every -ss value returned the audio at
+# 30.000s while a plain sequential decode of the same URL is correct), so
+# web VOD audio is decoded once, sequentially from zero, and every request
+# slices its exact window out of that in-memory buffer.  No seek involved.
+VOD_BUFFER_MAX_SECONDS = 7200.0  # retain at most ~230 MB of 16 kHz PCM
+VOD_IDLE_SECONDS = 300.0
+VOD_FILL_TIMEOUT = 60.0
+
 
 class BridgeError(RuntimeError):
-    def __init__(self, message: str, stage: str = "capture", empty: bool = False) -> None:
+    def __init__(
+        self,
+        message: str,
+        stage: str = "capture",
+        empty: bool = False,
+        transient: bool = False,
+    ) -> None:
         super().__init__(message)
         self.stage = stage
         self.empty = empty
+        # A transient failure means the underlying route/session is still
+        # healthy and must be kept; the caller simply retries later.
+        self.transient = transient
 
 
 def wav_bytes(pcm: bytes) -> bytes:
@@ -201,6 +220,116 @@ class LiveSession:
                 return prev_wall + (cur_wall - prev_wall) * ratio
             prev_frames, prev_wall = cur_frames, cur_wall
         return self.epochs[-1][1]
+
+    def kill(self) -> None:
+        with self.lock:
+            self.dead = True
+            if not self.error:
+                self.error = "session killed"
+        try:
+            self.process.kill()
+        except OSError:
+            pass
+
+
+class VodSession:
+    """One persistent sequential ffmpeg decoder for a web VOD source.
+
+    ffmpeg decodes from position zero with no -ss at all (Range seeks on DASH
+    m4s routes are unreliable and can silently return a fixed wrong position)
+    and appends 16 kHz mono PCM to an in-memory buffer.  Every request slices
+    its window by exact frame offsets, so a window is guaranteed to contain
+    the audio at the requested media time.  EOF is a normal end state: the
+    session keeps serving slices out of the retained buffer afterwards.
+    """
+
+    def __init__(self, key: str, resolved: ResolvedAudio, spawn_args: list[str]) -> None:
+        self.key = key
+        self.resolved = resolved
+        self.lock = threading.Lock()
+        self.buffer = bytearray()
+        self.base_frames = 0  # media frame index currently at buffer[0]
+        self.total_frames = 0  # cumulative decoded frames == media position
+        self.eof = False
+        self.dead = False
+        self.error = ""
+        self.last_used = time.monotonic()
+        self.started_at = time.monotonic()
+        self._stderr_tail = ""
+        self.process = subprocess.Popen(
+            spawn_args,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            **process_flags(),
+        )
+        self._stdout_thread = threading.Thread(target=self._read_stdout, daemon=True)
+        self._stderr_thread = threading.Thread(target=self._read_stderr, daemon=True)
+        self._stdout_thread.start()
+        self._stderr_thread.start()
+
+    def _read_stdout(self) -> None:
+        pending = b""
+        try:
+            while True:
+                data = self.process.stdout.read(16384)
+                if not data:
+                    break
+                data = pending + data
+                usable = len(data) - (len(data) % 2)
+                pending = data[usable:]
+                if usable <= 0:
+                    continue
+                frames = usable // 2
+                with self.lock:
+                    max_frames = int(VOD_BUFFER_MAX_SECONDS * LIVE_SAMPLE_RATE)
+                    excess = self.total_frames - self.base_frames + frames - max_frames
+                    if excess > 0:
+                        del self.buffer[: excess * 2]
+                        self.base_frames += excess
+                    self.buffer += data[:usable]
+                    self.total_frames += frames
+        except OSError:
+            pass
+        finally:
+            try:
+                self._stderr_thread.join(timeout=2.0)
+            except RuntimeError:
+                pass
+            returncode = self.process.poll()
+            with self.lock:
+                self.eof = True
+                if not self.dead and returncode not in (None, 0) and not self.error:
+                    self.error = self._stderr_tail.strip()[-400:] or "vod capture process exited"
+
+    def _read_stderr(self) -> None:
+        tail = b""
+        try:
+            while True:
+                chunk = self.process.stderr.read(4096)
+                if not chunk:
+                    break
+                tail = (tail + chunk)[-2000:]
+            self._stderr_tail = tail.decode("utf-8", "replace")
+        except OSError:
+            pass
+
+    def base_seconds(self) -> float:
+        with self.lock:
+            return self.base_frames / LIVE_SAMPLE_RATE
+
+    def fill_seconds(self) -> float:
+        with self.lock:
+            return self.total_frames / LIVE_SAMPLE_RATE
+
+    def slice_window(self, start: float, end: float) -> bytes:
+        """Return PCM for [start, end] seconds of media time (no waiting)."""
+        with self.lock:
+            f0 = max(self.base_frames, int(round(start * LIVE_SAMPLE_RATE)))
+            f1 = min(self.total_frames, int(round(end * LIVE_SAMPLE_RATE)))
+            if f1 <= f0:
+                return b""
+            return bytes(self.buffer[(f0 - self.base_frames) * 2 : (f1 - self.base_frames) * 2])
 
     def kill(self) -> None:
         with self.lock:
@@ -362,6 +491,7 @@ class WhisperBridge:
         self._subtitle_cache: dict[str, str] = {}
         self._jobs: dict[str, subprocess.Popen[bytes]] = {}
         self._live_sessions: dict[str, LiveSession] = {}
+        self._vod_sessions: dict[str, VodSession] = {}
         self._lock = threading.RLock()
         self._reaper = threading.Thread(target=self._reap_idle_sessions, daemon=True)
         self._reaper.start()
@@ -377,7 +507,15 @@ class WhisperBridge:
                     or (session.dead and now - session.last_used > 15.0)
                 ]
                 sessions = [self._live_sessions.pop(key) for key in stale]
+                stale_vod = [
+                    key for key, session in self._vod_sessions.items()
+                    if now - session.last_used > VOD_IDLE_SECONDS
+                    or (session.error and now - session.last_used > 15.0)
+                ]
+                vod_sessions = [self._vod_sessions.pop(key) for key in stale_vod]
             for session in sessions:
+                session.kill()
+            for session in vod_sessions:
                 session.kill()
 
     def put_subtitle(self, content: str, token: str | None = None) -> str:
@@ -416,10 +554,12 @@ class WhisperBridge:
             key = self.cache_key(payload)
             self._cache.pop(key, None)
             session = self._live_sessions.pop(key, None)
-        if session is not None:
-            # The route this reader holds may be what just failed; force a
-            # fresh resolve and respawn on the next request.
-            session.kill()
+            vod_session = self._vod_sessions.pop(key, None)
+        for item in (session, vod_session):
+            if item is not None:
+                # The route this reader holds may be what just failed; force a
+                # fresh resolve and respawn on the next request.
+                item.kill()
 
     def cancel(self, request_id: str) -> bool:
         with self._lock:
@@ -894,6 +1034,102 @@ class WhisperBridge:
             self._live_sessions[key] = session
         return session
 
+    def vod_session_for(self, payload: dict[str, Any], force_fresh: bool) -> VodSession:
+        """Return a healthy sequential VOD decoder for this web source.
+
+        A healthy session is reused as-is (skipping yt-dlp resolution entirely)
+        because its reader already holds a working route to the same audio.
+        The caller only reaches here for non-live web sources.
+        """
+        key = self.cache_key(payload)
+        if not force_fresh:
+            with self._lock:
+                session = self._vod_sessions.get(key)
+                if session is not None and not session.error:
+                    return session
+        resolved = self.source_for(payload, force_fresh)
+        if resolved.is_live:
+            raise BridgeError("web source switched to live mid-session", "capture")
+        return self.spawn_vod_session(key, resolved)
+
+    def spawn_vod_session(self, key: str, resolved: ResolvedAudio) -> VodSession:
+        ffmpeg = ffmpeg_path()
+        if not shutil.which(ffmpeg) and not Path(ffmpeg).is_file():
+            raise BridgeError("ffmpeg was not found", "capture")
+        # Sequential decode from zero: absolutely no -ss.  Seeking these DASH
+        # m4s routes through HTTP Range is unreliable, but a plain full read
+        # decodes the correct timeline every time.
+        args = [ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-rw_timeout", "15000000"]
+        args.extend(ffmpeg_input_args(resolved))
+        args.extend([
+            "-i", resolved.source,
+            "-map", resolved.map_spec or "0:a:0",
+            "-vn", "-sn", "-dn",
+            "-ac", "1", "-ar", "16000",
+            "-c:a", "pcm_s16le", "-f", "s16le", "pipe:1",
+        ])
+        with self._lock:
+            old = self._vod_sessions.get(key)
+        if old is not None:
+            old.kill()
+        session = VodSession(key, resolved, args)
+        with self._lock:
+            self._vod_sessions[key] = session
+        return session
+
+    def transcribe_vod(
+        self,
+        session: VodSession,
+        endpoint: str,
+        payload: dict[str, Any],
+        started: float,
+    ) -> dict[str, Any]:
+        start = max(0.0, number(payload.get("start")))
+        duration = min(max(number(payload.get("duration"), 6.0), 1.0), 30.0)
+        end = start + duration
+        t_recv = time.monotonic()
+        # Wait until the sequential decoder has covered the requested window.
+        # ffmpeg decodes far faster than realtime, so this only takes real time
+        # right after spawn or after a deep forward seek.
+        while True:
+            with session.lock:
+                base = session.base_frames / LIVE_SAMPLE_RATE
+                filled = session.total_frames / LIVE_SAMPLE_RATE
+                eof = session.eof
+                error = session.error
+            if error:
+                raise BridgeError(f"vod capture stopped: {error}", "capture")
+            if start + 0.05 < base:
+                # The window predates the retained buffer (a seek far back on a
+                # very long video).  Invalidate so the retry rebuilds from zero.
+                raise BridgeError("vod window fell out of the retained buffer", "capture")
+            if filled >= end or eof:
+                break
+            if time.monotonic() - t_recv > VOD_FILL_TIMEOUT:
+                # The decoder is still working through the file; keep it alive
+                # and let the caller retry against the same session.
+                raise BridgeError(
+                    "vod capture is still decoding the requested window", "capture", transient=True
+                )
+            time.sleep(0.05)
+        pcm = session.slice_window(start, min(end, session.fill_seconds()))
+        with session.lock:
+            session.last_used = time.monotonic()
+        if len(pcm) < MIN_AUDIO_BYTES:
+            raise BridgeError("vod window is empty", "capture", empty=True)
+        response = self.whisper(endpoint, wav_bytes(pcm))
+        response["ok"] = True
+        response["is_live"] = False
+        response["vod_persist"] = True
+        response["window_start"] = start
+        response["window_duration"] = len(pcm) / LIVE_BYTES_PER_SECOND
+        response["capture_started_after"] = t_recv - started
+        response["capture_finished_after"] = time.monotonic() - started
+        response["capture_duration"] = len(pcm) / LIVE_BYTES_PER_SECOND
+        response["audio_selection"] = session.resolved.selection
+        response["web_source"] = True
+        return response
+
     def transcribe_live(
         self,
         session: LiveSession,
@@ -957,6 +1193,7 @@ class WhisperBridge:
         force_refresh = bool(payload.get("refresh_web"))
         last_error: BridgeError | None = None
         resolved: ResolvedAudio | None = None
+        session_live: bool | None = None
         for attempt in range(2 if is_web else 1):
             try:
                 attempt_payload = dict(payload)
@@ -966,11 +1203,23 @@ class WhisperBridge:
                 if is_web:
                     # A retry after a capture/resolve failure must rebuild the
                     # reader; after a whisper failure the existing reader is
-                    # still good and must be kept.
-                    refresh_session = attempt > 0 and last_error is not None and last_error.stage != "whisper"
+                    # still good and must be kept.  A transient failure (VOD
+                    # decoder still filling) keeps its session too: the retry
+                    # continues waiting against the same decoder.
+                    refresh_session = (
+                        attempt > 0
+                        and last_error is not None
+                        and last_error.stage != "whisper"
+                        and not last_error.transient
+                    )
                     session = self.live_session_for(attempt_payload, refresh_session)
                     if session is not None:
+                        session_live = True
                         return self.transcribe_live(session, endpoint, payload, attempt_payload, started)
+                    vod_session = self.vod_session_for(attempt_payload, refresh_session)
+                    if vod_session is not None:
+                        session_live = False
+                        return self.transcribe_vod(vod_session, endpoint, payload, started)
                 resolved = self.source_for(attempt_payload, force_refresh or attempt > 0)
                 audio = self.capture_audio(resolved, attempt_payload, request_id)
                 response = self.whisper(endpoint, audio.data)
@@ -992,7 +1241,7 @@ class WhisperBridge:
                     return {
                         "ok": True,
                         "segments": [],
-                        "is_live": resolved.is_live if resolved is not None else True,
+                        "is_live": resolved.is_live if resolved is not None else bool(session_live),
                         "audio_selection": resolved.selection if resolved is not None else "live",
                         "web_source": is_web,
                         "capture_offset": 0.0,
@@ -1002,9 +1251,10 @@ class WhisperBridge:
                     }
                 if not is_web or attempt:
                     break
-                if error.stage != "whisper":
+                if error.stage != "whisper" and not error.transient:
                     # Whisper-side failures are unrelated to the resolved route;
                     # keep any live reader alive and just retry the inference.
+                    # Transient failures keep their session filling.
                     self.invalidate(payload)
         raise last_error or BridgeError("Whisper bridge request failed", "bridge")
 

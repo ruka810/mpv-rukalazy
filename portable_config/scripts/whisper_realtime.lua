@@ -37,17 +37,19 @@ local TRACK_PREFIX = 'Whisper realtime'
 local SUBTITLE_TOKEN = 'realtime'
 local MIN_TRANSLATE_INTERVAL = 0.8      -- 相邻翻译请求最小间隔（秒），限流
 local TRANSLATE_FAIL_COOLDOWN = 30      -- 翻译失败后的冷却（秒），避免打爆接口
+local TRANSLATE_FAIL_RETRY_SECONDS = 60 -- 某句失败后暂时退出泵选（秒），避免同一失败句反复被选、饿死其它待翻句
 local TRANSLATE_TARGET = 'zh-CN'        -- 目标语言固定简体中文
--- 依次尝试的翻译端点：首个 `client=gtx` 接口被节点 IP 反爬拦截（返回 HTML "Sorry"）时，
--- 自动回退到 Chrome 内置翻译接口 `client=dict-chrome-ex`（同样为 Google 官方网页端）。
+-- 依次尝试的翻译端点。实测 `client=gtx` 端点常被节点 IP 反爬拦截（返回 HTML/空），
+-- 每次都先撞它失败再回退会白白损失一次请求和约 0.6s 延迟。故将更稳的 Chrome 内置
+-- 接口 `client=dict-chrome-ex` 放首位，`client=gtx` 作为回退。
 local TRANSLATE_ENDPOINTS = {
-    {
-        url = 'https://translate.googleapis.com/translate_a/single',
-        params = { 'client=gtx', 'sl=auto', 'tl=zh-CN', 'dt=t' },
-    },
     {
         url = 'https://translate.googleapis.com/translate_a/t',
         params = { 'anno=3', 'client=dict-chrome-ex', 'sl=auto', 'tl=zh-CN', 'v=1.0' },
+    },
+    {
+        url = 'https://translate.googleapis.com/translate_a/single',
+        params = { 'client=gtx', 'sl=auto', 'tl=zh-CN', 'dt=t' },
     },
 }
 
@@ -98,6 +100,7 @@ local state = {
     live_persist = false,          -- 当前是否走桥接服务的持久直播采集会话
     translation_cache = {},        -- [normalized原文] = 译文   （相同原文复用）
     translation_pending = {},      -- [原文]=true 待翻译/在飞/失败不再自动重试
+    translation_failed = {},       -- [原文]=最近一次失败时刻，用于按句退避、避免饿死泵选
     translation_busy = false,      -- 是否有请求在飞（限流）
     translation_last_sent = 0,
     translation_retry_after = 0,
@@ -243,10 +246,13 @@ local function add_segment(segment, absolute_start, zh_origin)
             if end_time > old.finish + 0.15 or start_time < old.start - 0.15 then
                 local merged_text = text
                 if #old.text > #text then merged_text = old.text end
+                -- 归一化键保持旧值（合并去重的身份标识），文本取更完整的一句：
+                -- 屏幕上继续显示长文本，但缓存/泵选用稳定的键，避免同一句随识别
+                -- 增长而反复被当作"新句"重复翻译、浪费限流预算。
                 state.events[index] = {
                     start = old.start,
                     finish = math.max(end_time, old.finish),
-                    text = merged_text, normalized = merged_text, comparable = old.comparable,
+                    text = merged_text, normalized = old.normalized, comparable = old.comparable,
                     zh = old.zh,
                 }
             end
@@ -259,7 +265,7 @@ local function add_segment(segment, absolute_start, zh_origin)
             state.events[index] = {
                 start = old.start,
                 finish = math.max(end_time, old.finish),
-                text = merged_text, normalized = merged_text, comparable = old.comparable,
+                text = merged_text, normalized = old.normalized, comparable = old.comparable,
                 zh = old.zh,
             }
             return
@@ -562,6 +568,7 @@ local function do_translate(key, endpoint_index)
             if translated ~= '' then
                 state.translation_cache[key] = translated
                 state.translation_pending[key] = nil
+                state.translation_failed[key] = nil
                 state.translation_busy = false
                 if state.enabled and state.translate_enabled then
                     refresh_track(now_time() or 0)
@@ -574,11 +581,13 @@ local function do_translate(key, endpoint_index)
             do_translate(key, endpoint_index + 1)
             return
         end
+        state.translation_failed[key] = mp.get_time()
         state.translation_busy = false
         msg.error(string.format('[whisper_realtime] translate all endpoints failed: key=%q success=%s status=%s error=%s stdout=%s',
             key, tostring(success), tostring(result and result.status), tostring(error_message),
             trim(stdout):sub(1, 512)))
-        -- 全部端点点失败只进入冷却，不停止 Whisper，也不反复重试同一句。
+        -- 全部端点点失败只进入冷却，不停止 Whisper；该句暂时退出泵选，
+        -- 冷却结束后泵转去翻其它句，避免同一失败句反复重试饿死其它待翻句。
         state.translation_retry_after = mp.get_time() + TRANSLATE_FAIL_COOLDOWN
     end)
 end
@@ -613,11 +622,14 @@ local function pump_translation()
     if mp.get_time() < state.translation_retry_after then return end
     if mp.get_time() - state.translation_last_sent < MIN_TRANSLATE_INTERVAL then return end
     local current = now_time()
+    local now = mp.get_time()
     local best_key, best_distance
     for _, event in ipairs(state.events) do
         local key = event.normalized
         if key and key ~= '' and state.translation_pending[key]
-            and not state.translation_cache[key] then
+            and not state.translation_cache[key]
+            -- 最近失败过的句子先跳过，让泵去翻其它待翻句（限流退潮后可重试）。
+            and not (state.translation_failed[key] and now - state.translation_failed[key] < TRANSLATE_FAIL_RETRY_SECONDS) then
             local distance = current and math.abs(event.start - current) or math.huge
             if not best_key or distance < best_distance then
                 best_key, best_distance = key, distance

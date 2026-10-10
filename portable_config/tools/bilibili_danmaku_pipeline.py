@@ -36,7 +36,7 @@ def run_child(args: list[str], label: str) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--bvid", required=True)
+    parser.add_argument("--bvid", default=None)
     parser.add_argument("--page", type=int, required=True)
     parser.add_argument("--width", type=int, required=True)
     parser.add_argument("--height", type=int, required=True)
@@ -48,24 +48,31 @@ def main() -> int:
     parser.add_argument("--overlay-output", required=True)
     parser.add_argument("--error-output", required=True)
     parser.add_argument("--user-agent", required=True)
+    parser.add_argument("--cid", type=int, default=None)
     args = parser.parse_args()
 
     try:
         fetch_base = [sys.executable, args.fetcher, "--bridge", args.bridge, "--user-agent", args.user_agent]
-        run_child(
-            fetch_base + [
-                "--url", f"https://api.bilibili.com/x/web-interface/view?bvid={args.bvid}",
-                "--output", args.api_output,
-            ],
-            "Bilibili view API",
-        )
-        response = json.loads(Path(args.api_output).read_text(encoding="utf-8"))
-        video = response.get("data") if response.get("code") == 0 else None
-        pages = video.get("pages") if isinstance(video, dict) else None
-        selected = pages[args.page - 1] if isinstance(pages, list) and 0 < args.page <= len(pages) else None
-        cid = selected.get("cid") if isinstance(selected, dict) else (video.get("cid") if args.page == 1 and isinstance(video, dict) else None)
-        if not cid:
-            raise RuntimeError("Bilibili view API did not return a CID")
+        if args.cid:
+            # 直连模式：cid 已由浏览器侧直接提供（如 __INITIAL_STATE__），跳过 view API。
+            cid = args.cid
+        else:
+            if not args.bvid:
+                raise RuntimeError("neither --bvid nor --cid given")
+            run_child(
+                fetch_base + [
+                    "--url", f"https://api.bilibili.com/x/web-interface/view?bvid={args.bvid}",
+                    "--output", args.api_output,
+                ],
+                "Bilibili view API",
+            )
+            response = json.loads(Path(args.api_output).read_text(encoding="utf-8"))
+            video = response.get("data") if response.get("code") == 0 else None
+            pages = video.get("pages") if isinstance(video, dict) else None
+            selected = pages[args.page - 1] if isinstance(pages, list) and 0 < args.page <= len(pages) else None
+            cid = selected.get("cid") if isinstance(selected, dict) else (video.get("cid") if args.page == 1 and isinstance(video, dict) else None)
+            if not cid:
+                raise RuntimeError("Bilibili view API did not return a CID")
 
         run_child(
             fetch_base + ["--url", f"https://comment.bilibili.com/{cid}.xml", "--output", args.xml_output],

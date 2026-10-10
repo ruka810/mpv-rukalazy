@@ -69,7 +69,7 @@ local opacity_min, opacity_max = 20, 100
 -- 参数默认值。启动时读取 mpv 现有弹幕配置（script-opts 中
 -- bilibili_danmaku-opacity / -area / -font-size，百分比）作为初始值，
 -- 而不是硬编码 100。菜单调整一律为“绝对设置”，不会基于当前值再次乘算。
-local opts = { opacity = 100, area = 100, font_size = 100 }
+local opts = { opacity = 100, area = 100, font_size = 100, preload_cid = 0 }
 options.read_options(opts, 'bilibili_danmaku')
 local render_area = math.max(area_min, math.min(area_max, math.floor(opts.area + 0.5)))
 local render_opacity = math.max(opacity_min, math.min(opacity_max, math.floor(opts.opacity + 0.5)))
@@ -922,7 +922,7 @@ local function current_source_kind()
     local room_id, live_path = current_bilibili_live()
     if room_id then return 'live', room_id, live_path end
     local bvid, page, video_path = current_bilibili_video()
-    if bvid then return 'video', bvid, page, video_path end
+    if bvid then return 'video', bvid, page, video_path, (source_context and source_context.cid) end
     return nil
 end
 
@@ -1302,7 +1302,7 @@ local function start_vod_output_job(token, source_path, phase, args, output_path
     watch_output()
 end
 
-local function get_cid_and_download(token, bvid, page, source_path)
+local function get_cid_and_download(token, bvid, page, source_path, cid)
     local api_file = temporary_path(bvid, token, '.api.json')
     local xml_file = temporary_path(bvid, token, '.xml')
     local overlay_file = temporary_path(bvid, token, '.overlay.json')
@@ -1318,6 +1318,10 @@ local function get_cid_and_download(token, bvid, page, source_path)
         '--api-output', api_file, '--xml-output', xml_file, '--overlay-output', overlay_file,
         '--error-output', error_file, '--user-agent', BILIBILI_USER_AGENT,
     }
+    if cid and cid > 0 then
+        table.insert(args, '--cid')
+        table.insert(args, tostring(cid))
+    end
     start_vod_output_job(token, source_path, 'vod-pipeline', args, overlay_file,
         function(contents)
             local manifest = utils.parse_json(contents)
@@ -1333,7 +1337,7 @@ local function get_cid_and_download(token, bvid, page, source_path)
         '加载 Bilibili 弹幕失败', error_file)
 end
 
-local function start_vod(bvid, page, source_path)
+local function start_vod(bvid, page, source_path, cid)
     if active and active.source_path == source_path then return end
     if loading then
         if loading_source_path == source_path then return end
@@ -1348,7 +1352,7 @@ local function start_vod(bvid, page, source_path)
     loading = true
     loading_source_path = source_path
     mp.osd_message('正在加载 Bilibili 弹幕', 2)
-    get_cid_and_download(request_id, bvid, page, source_path)
+    get_cid_and_download(request_id, bvid, page, source_path, cid)
 end
 
 local function write_stop_file(path)
@@ -1652,12 +1656,33 @@ local function restore_live_after_refresh()
     if update_open_menu then update_open_menu() end
 end
 
+local function apply_preload_cid()
+    -- 桥投递的 CDN 直链无法被 remember_source_context 识别为 Bilibili 视频。
+    -- 若 mpv 启动时带上了 --script-opts=bilibili_danmaku-preload-cid=<cid>
+    -- （bilibili_parse_bridge 从浏览器页面 __INITIAL_STATE__ 取得），此处把当前
+    -- 文件注入为带 cid 的 video 上下文，使 D 键弹幕 / 自动加载能够工作。
+    local preload_cid = tonumber(opts.preload_cid) or 0
+    if preload_cid <= 0 then return end
+    if current_source_kind() then return end
+    local item = playlist_item()
+    local source_path = item and (item.filename or item.path) or ''
+    source_context = {
+        generation = source_generation,
+        kind = 'video',
+        bvid = 'C' .. preload_cid,
+        page = 1,
+        cid = preload_cid,
+        path = source_path,
+        entry_id = item and item.id or nil,
+    }
+end
+
 local function apply_settings_to_current()
-    local kind, a, b, c = current_source_kind()
+    local kind, a, b, c, d = current_source_kind()
     if kind == 'video' then
         stop_live()
         if enabled.normal then
-            start_vod(a, b, c)
+            start_vod(a, b, c, d)
         else
             stop_vod()
         end
@@ -1919,6 +1944,7 @@ mp.register_event('file-loaded', function()
         remember_source_context()
         restore_live_refresh_context()
         remove_automatic_bilibili_danmaku()
+        apply_preload_cid()
         apply_settings_to_current()
         update_live_send_availability()
         if live_refresh_context then

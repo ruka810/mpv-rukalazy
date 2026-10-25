@@ -6,6 +6,12 @@ param(
     [int]$DefaultScale = 1
 )
 
+# mpv reads subprocess stdout as UTF-8. Windows PowerShell otherwise inherits
+# the launcher's console code page (often CP936), corrupting Chinese paths.
+$captureUtf8 = New-Object System.Text.UTF8Encoding($false)
+[Console]::OutputEncoding = $captureUtf8
+$OutputEncoding = $captureUtf8
+
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 

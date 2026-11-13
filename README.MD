@@ -12,6 +12,16 @@
 
 ---
 
+## 三步开始
+
+1. **下载解压**：到 [Releases](../../releases) 下载全部分卷，用 7-Zip 解压 `.001` 到可写目录。
+2. **安装 ffmpeg**：加入系统 `PATH`（包内不含）。
+3. **按需注册**：文件关联双击 `installer\mpv-register.bat`；要 Cookie 桥 / 浏览器投递再运行对应的 `.ps1`。
+
+代理端口不是 `10809` 的，先改 [首次配置 · 代理](#代理重要)，否则联网播放会失败。
+
+---
+
 ## 功能一览
 
 ### 播放与界面
@@ -71,12 +81,11 @@
 
 ### 1. 下载分卷并解压
 
-完整包约 5 GB，受 GitHub 单文件 2 GiB 限制，Release 里拆成了分卷：
+完整包约 5 GB，受 GitHub 单文件 2 GiB 限制，Release 里拆成了多个分卷（数量以 Release 页面为准）：
 
 ```
 mpv-rukalazy-v1.0.0.7z.001
 mpv-rukalazy-v1.0.0.7z.002
-mpv-rukalazy-v1.0.0.7z.003
 ...
 ```
 
@@ -240,7 +249,6 @@ mpv-rukalazy/
 - 本项目不收集、不上传任何数据。
 - Cookie 由浏览器扩展经本机命名管道交给桥；为兼容 yt-dlp，桥会在 `portable_config/_cache/cookies/` 写出 Netscape 格式的 cookie 文件。该文件只在本机、不会上传，删除 `_cache` 即可清除。
 - 本地桥（B 站投递）只监听 `127.0.0.1:8322`，且只接受本机请求。
-- `portable_config/_cache/`、`watch_later`、日志等均为本机运行时数据，已从版本库排除。
 
 ---
 

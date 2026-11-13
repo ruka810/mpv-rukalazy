@@ -242,6 +242,9 @@ mpv-rukalazy/
 **Q：移动了文件夹之后浏览器投递/文件关联失效？**
 重新运行 `installer/mpv-register.bat` 与 `portable_config/tools/install_bridge_scheme.ps1`（注册信息里记的是绝对路径）。
 
+**Q：更新了新功能，必须重下 3.4 GB 的完整包吗？**
+不必。只改脚本/配置时，可以下载仓库源码覆盖 `portable_config/`，详见 [教程 · 用仓库源码覆盖更新](docs/使用教程.md#用仓库源码覆盖更新不重下完整包)。
+
 ---
 
 ## 隐私说明

@@ -24,6 +24,18 @@
 
 ---
 
+## 界面预览
+
+B 站视频：弹幕 + uosc 控制栏 + 字幕轨道。
+
+![B 站弹幕与控制栏](docs/images/main.png)
+
+| 右键菜单 | 弹幕设置（`Ctrl+d`） |
+| --- | --- |
+| ![右键菜单](docs/images/menu.png) | ![弹幕设置](docs/images/danmaku-settings.png) |
+
+---
+
 ## 功能一览
 
 ### 播放与界面

@@ -1,4 +1,4 @@
-﻿*.exe
+*.exe
 *.dll
 *.onnx
 *.bin
@@ -9,7 +9,44 @@
 *.rar
 *.tmp
 *.log
+*.pdb
+*.bak
+*.orig
+*.rej
+*.crx
+*.mp4
+*.mkv
+*.wav
+*.flac
+*.srt
+*.ass
 vs-plugins/vsmlrt-cuda/
 
+# 运行时缓存与播放状态（每个人不同，不纳入版本库）
 portable_config/_cache/
+portable_config/cache/
+portable_config/watch_later/
+portable_config/saved-props.json
+portable_config/live-favorites.json
+portable_config/tools/*.lock
+portable_config/scripts/bilibili_danmaku_state.conf
+
+# Chrome Cookie 桥的构建产物、依赖与签名私钥
+portable_config/tools/chrome_cookie_bridge/extension.pem
+portable_config/tools/chrome_cookie_bridge/extension.crx
+portable_config/tools/chrome_cookie_bridge/extension.zip
+portable_config/tools/chrome_cookie_bridge/com.mpv_lazy.cookie_bridge.json
+portable_config/tools/chrome_cookie_bridge/host/bin/
+portable_config/tools/chrome_cookie_bridge/host/obj/
+portable_config/tools/chrome_cookie_bridge/pot_provider_src/**/node_modules/
+portable_config/tools/chrome_cookie_bridge/pot_provider_src/**/build/
+
+# Python / 编辑器 / 个人文档
+__pycache__/
+*.pyc
+*.pyo
+.trae/
+.vscode/
+.idea/
+*.pptx
 test_speech.mp4

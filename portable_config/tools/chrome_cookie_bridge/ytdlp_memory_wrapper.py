@@ -81,7 +81,6 @@ def find_node() -> str | None:
 
     candidates = [
         os.environ.get("MPV_LAZY_NODE"),
-        r"E:\nodejs\node.exe",
         shutil.which("node"),
     ]
     for candidate in candidates:

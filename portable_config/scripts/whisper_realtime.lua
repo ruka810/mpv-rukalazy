@@ -1,10 +1,35 @@
 local mp = require 'mp'
 local msg = require 'mp.msg'
 local utils = require 'mp.utils'
+local options = require 'mp.options'
 
 -- Session-only realtime subtitles. Audio, JSON, and subtitle text never use a
 -- filesystem path; the Python bridge captures audio and uploads it in memory.
-local WHISPER_ROOT = 'E:\\whisper'
+
+-- Whisper 目录查找顺序（任选其一即可，便于整个文件夹换盘/换机器）：
+--   1. script-opts 里的 whisper_realtime-whisper_root
+--   2. 懒人包根目录下的 whisper
+--   3. 当前盘符根目录下的 whisper（例如 E:\whisper）
+local whisper_opts = { whisper_root = '' }
+options.read_options(whisper_opts, 'whisper_realtime')
+
+local function has_whisper_server(dir)
+    if not dir or dir == '' then return false end
+    local info = utils.file_info(dir .. '\\whisper-server.exe')
+    return info ~= nil and info.is_file
+end
+
+local function resolve_whisper_root()
+    if has_whisper_server(whisper_opts.whisper_root) then return whisper_opts.whisper_root end
+    local packaged = mp.command_native({ 'expand-path', '~~/../whisper' })
+    if has_whisper_server(packaged) then return packaged end
+    local drive = packaged:match('^(%a:)[\\/]') or ''
+    local drive_root = drive .. '\\whisper'
+    if has_whisper_server(drive_root) then return drive_root end
+    return packaged
+end
+
+local WHISPER_ROOT = resolve_whisper_root()
 local WHISPER_SERVER = WHISPER_ROOT .. '\\whisper-server.exe'
 local WHISPER_MODEL = WHISPER_ROOT .. '\\models\\ggml-large-v3-turbo-q5_0.bin'
 local CURL = 'curl.exe'
@@ -1124,7 +1149,7 @@ local function enable()
     if state.enabled then return end
     if not file_exists(WHISPER_SERVER) or not file_exists(WHISPER_MODEL)
         or not file_exists(PYTHON) or not file_exists(REQUEST_BRIDGE) then
-        mp.osd_message('找不到 E:\\whisper 的 Whisper CUDA 文件', 4)
+        mp.osd_message('找不到 Whisper 文件：' .. WHISPER_ROOT .. '（详见 docs/使用教程.md）', 5)
         return
     end
     if not file_exists('C:\\Program Files\\ffmpeg\\bin\\ffmpeg.exe') and not file_exists('C:\\Windows\\System32\\ffmpeg.exe') then

@@ -1,0 +1,53 @@
+#!/bin/sh
+# 提交前检查：阻止把个人数据 / 运行时文件 / 密钥提交到仓库。
+# 启用方式（每个克隆执行一次）：
+#   git config core.hooksPath .githooks
+# 临时跳过：git commit --no-verify
+
+blocked=""
+
+# 拦截：日志/密钥/缓存/临时文件、个人媒体、Python 缓存、
+# mpv 与脚本运行时状态、Cookie 桥生成物、编辑器与个人文档。
+while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    case "$f" in
+        *.log|*.pem|*.crx|*.pdb|*.pyc|*.pyo|*.bak|*.orig|*.rej|*.tmp)
+            blocked="$blocked
+  $f" ;;
+        *.mp4|*.mkv|*.wav|*.flac|*.srt|*.ass)
+            blocked="$blocked
+  $f" ;;
+        *__pycache__/*|*/__pycache__/*)
+            blocked="$blocked
+  $f" ;;
+        portable_config/_cache/*|portable_config/cache/*|portable_config/watch_later/*)
+            blocked="$blocked
+  $f" ;;
+        portable_config/saved-props.json|portable_config/live-favorites.json)
+            blocked="$blocked
+  $f" ;;
+        portable_config/tools/*.lock|portable_config/scripts/bilibili_danmaku_state.conf)
+            blocked="$blocked
+  $f" ;;
+        portable_config/tools/chrome_cookie_bridge/*.pem|portable_config/tools/chrome_cookie_bridge/*.crx|portable_config/tools/chrome_cookie_bridge/com.mpv_lazy.cookie_bridge.json)
+            blocked="$blocked
+  $f" ;;
+        .trae/*|.vscode/*|*.pptx)
+            blocked="$blocked
+  $f" ;;
+    esac
+done <<EOF
+$(git diff --cached --name-only --diff-filter=ACM)
+EOF
+
+if [ -n "$blocked" ]; then
+    echo "✗ 提交被阻止：检测到个人 / 运行时 / 隐私文件"
+    printf '%s\n' "$blocked"
+    echo ""
+    echo "请取消暂存后重试："
+    echo "  git restore --staged <文件>"
+    echo "如确认要提交，使用：git commit --no-verify"
+    exit 1
+fi
+
+exit 0

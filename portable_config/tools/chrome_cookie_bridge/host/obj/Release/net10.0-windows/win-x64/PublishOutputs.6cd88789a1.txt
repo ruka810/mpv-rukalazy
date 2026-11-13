@@ -1,2 +1,0 @@
-E:\mpv-lazy\portable_config\tools\chrome_cookie_bridge\publish\mpv-cookie-bridge.pdb
-E:\mpv-lazy\portable_config\tools\chrome_cookie_bridge\publish\mpv-cookie-bridge.exe

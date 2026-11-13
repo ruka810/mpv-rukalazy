@@ -13,7 +13,8 @@ internal static class Program
     private const string PipeName = "mpv-lazy-chrome-cookie-bridge-v2";
     private const int WebBridgePort = 49814;
     private const string ExtensionOrigin = "chrome-extension://gikjlcfdnjgmdbdnefmknkpndmkfdlhf";
-    private const string CookieExportPath = @"E:\AAADownload\ZZZmix\cookies\yt+bilibili_5c1472d7-4ffd-41df-91f9-54d5a6e238a0.txt";
+    private static readonly string CookieExportPath = Path.Combine(
+        WorkspaceRoot(), "portable_config", "_cache", "cookies", "yt+bilibili.txt");
     private static readonly JsonSerializerOptions Json = new() { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
 
     private static async Task<int> Main(string[] args)
@@ -481,8 +482,7 @@ internal static class Program
         if (!string.IsNullOrWhiteSpace(configured) && File.Exists(configured)) return configured;
         var workspacePython = Path.Combine(WorkspaceRoot(), "python.exe");
         if (File.Exists(workspacePython)) return workspacePython;
-        const string systemPython = @"E:\Python314\python.exe";
-        return File.Exists(systemPython) ? systemPython : "python.exe";
+        return "python.exe";
     }
 
     private static async Task<JsonDocument?> ReadNativeMessageAsync(Stream input, CancellationToken cancellation)

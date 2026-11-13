@@ -7,7 +7,7 @@ local utils = require 'mp.utils'
 -- legacy menu bindings.
 
 local bridge = mp.command_native({ 'expand-path', '~~/tools/chrome_cookie_bridge/publish_v13/mpv-cookie-bridge.exe' })
-local node = 'E:/nodejs/node.exe'
+local node = os.getenv('MPV_LAZY_NODE') or 'node'
 local pot_server = mp.command_native({ 'expand-path', '~~/tools/chrome_cookie_bridge/pot_provider_src/bgutil-ytdlp-pot-provider-1.3.1/server/build/main.js' })
 math.randomseed(os.time() + math.floor(mp.get_time() * 1000000))
 local session_id = string.format('%d-%d', os.time(), math.random(1, 0x7fffffff))

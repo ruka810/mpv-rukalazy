@@ -20,7 +20,7 @@ while IFS= read -r f; do
         *__pycache__/*|*/__pycache__/*)
             blocked="$blocked
   $f" ;;
-        portable_config/_cache/*|portable_config/cache/*|portable_config/watch_later/*)
+        portable_config/_cache/*|portable_config/cache/*|portable_config/watch_later/*|_backup/*)
             blocked="$blocked
   $f" ;;
         portable_config/saved-props.json|portable_config/live-favorites.json)

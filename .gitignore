@@ -22,6 +22,9 @@
 *.ass
 vs-plugins/vsmlrt-cuda/
 
+# 配置备份（installer/backup-config.bat 生成，仅本机）
+_backup/
+
 # 运行时缓存与播放状态（每个人不同，不纳入版本库）
 portable_config/_cache/
 portable_config/cache/

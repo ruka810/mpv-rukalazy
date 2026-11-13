@@ -70,6 +70,7 @@ B 站视频：弹幕 + uosc 控制栏 + 字幕轨道。
 ### YouTube 与其他网页视频
 
 - 内置 `yt-dlp.exe`，支持 YouTube、Bilibili 等站点。
+- **网页跳转慢或打不开时，复制链接在 mpv 里按 `Ctrl+v` 粘贴播放更快**（合集用 `Ctrl+Shift+v`）。
 - **Chrome Cookie 桥**：由 Chrome 扩展读取登录态 cookies，供会员内容、B 站 AI 字幕等使用；仅本机使用，不上传。
 - YouTube Mix/播放列表自动展开。
 - 网页媒体的画质/格式可在 uosc 菜单中切换。
@@ -264,6 +265,9 @@ yt-dlp 单独更新：`yt-dlp.exe -U`。
 
 **Q：弹幕不显示？**
 确认是 B 站视频/直播，并且按过 `d` 开启；CDN 直链也会自动识别 cid。
+
+**Q：YouTube 链接打不开 / 一直转圈跳不过去？**
+**直接把链接复制下来，在 mpv 里按 `Ctrl+v` 粘贴播放，比等浏览器跳转更快**（合集用 `Ctrl+Shift+v`）。也可以把地址粘进 mpv 窗口回车，或命令行 `mpv.exe "链接"`。
 
 **Q：补帧/超分没效果？**
 需要 NVIDIA 显卡 + 最新驱动；AMD/Intel 上 CUDA 滤镜会自动跳过。

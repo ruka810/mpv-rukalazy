@@ -69,15 +69,25 @@
 
 ## 下载与安装
 
-### 1. 获取完整包
+### 1. 下载分卷并解压
 
-到 [Releases](../../releases) 下载最新的完整包（`.7z`），解压到**可写目录**，例如：
+完整包约 5 GB，受 GitHub 单文件 2 GiB 限制，Release 里拆成了分卷：
 
 ```
-D:\mpv-rukalazy\
+mpv-rukalazy-v1.0.0.7z.001
+mpv-rukalazy-v1.0.0.7z.002
+mpv-rukalazy-v1.0.0.7z.003
+...
 ```
 
-> 不要放在 `C:\Program Files` 等需要管理员权限的目录；脚本需要在该目录内写缓存和日志。
+到 [Releases](../../releases) 把**全部分卷**下载到同一个文件夹，然后：
+
+1. 右键 `.001` → 7-Zip → 「解压到当前文件夹」，目标目录例如 `D:\mpv-rukalazy\`。
+2. 其余分卷会被自动读取，**不要**单独解压或改名。
+3. 缺任何一个分卷都会报「无法打开压缩包」。
+
+> 需要先装 [7-Zip](https://www.7-zip.org/)（Windows 自带的解压不支持 7z 分卷）。
+> 解压到**可写目录**：不要放 `C:\Program Files` 等需要管理员权限的位置，也不要放 OneDrive 等会同步/占位的目录；脚本需要在该目录内写缓存和日志。
 
 ### 2. 安装必需依赖：ffmpeg
 
@@ -89,17 +99,30 @@ ffmpeg **不在压缩包内**，请自行安装并加入 `PATH`：
 
 用途：Whisper 音频采集、片段导出、VSPipe 渲染等。
 
-### 3. 运行
+### 3. 首次运行
 
-双击 `mpv.exe` 即可。想直接双击视频文件播放，运行一次：
+双击 `mpv.exe` 就能播放（拖入视频文件也可以）。第一次启动会自动生成 `portable_config/_cache/` 等运行时目录，属正常现象。
 
+### 4. 注册（建议至少做第 1 项）
+
+mpv 本身是绿色的，不做注册也能播放本地文件。但下面三项会把**当前文件夹的绝对路径**写进注册表，换取系统集成；换目录或复制到别的电脑后必须重跑：
+
+| 脚本 | 作用 | 是否需要管理员 |
+| --- | --- | --- |
+| `installer\mpv-register.bat` | 文件关联：双击视频/音频默认用 mpv 打开，右键「使用 mpv 播放」。取消用 `installer\mpv-unregister.bat` | 是（会弹 UAC） |
+| `portable_config\tools\install_bridge_scheme.ps1` | 注册 `bilibili-mpv://` 协议，浏览器投递按钮才能唤醒 mpv | 否 |
+| `portable_config\tools\chrome_cookie_bridge\install_native_host.ps1` | 注册 Chrome 原生消息桥，Cookie 桥扩展才能把 cookies 交给 mpv | 否 |
+
+运行方式：`mpv-register.bat` 直接双击；两个 `.ps1` 在 PowerShell 里执行（路径换成你的解压位置）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File "D:\mpv-rukalazy\portable_config\tools\install_bridge_scheme.ps1"
+powershell -ExecutionPolicy Bypass -File "D:\mpv-rukalazy\portable_config\tools\chrome_cookie_bridge\install_native_host.ps1"
 ```
-installer\mpv-register.bat
-```
 
-（会弹 UAC；卸载用 `installer\mpv-unregister.bat`。）
+> 只播放本地视频的话，可以只做第 1 项，或者什么都不做。Cookie 桥、浏览器投递按需再装。
 
-### 4. 可选组件
+### 5. 可选组件
 
 按需安装，不装也能正常播放本地文件：
 

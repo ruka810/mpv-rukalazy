@@ -5,10 +5,12 @@
 
 本项目是 [mpv](https://github.com/mpv-player/mpv) 的便携配置集合。把整个文件夹复制到任意盘符、任意目录即可运行，配置、字体、脚本、着色器都跟随目录，不写注册表（除非你主动运行注册脚本）。
 
+**适用环境**：Windows 10 / 11 64 位；补帧、超分与 Whisper CUDA 需要 NVIDIA 显卡。
+
 - **详细安装与配置教程：[docs/使用教程.md](docs/使用教程.md)**
 - **下载：请到本仓库的 [Releases](../../releases) 获取完整懒人包（推荐）**
 
-> 仓库本身受 `.gitignore` 限制，不包含 `mpv.exe`、`ffmpeg`、VapourSynth CUDA 运行库、Whisper 模型等大文件。**只克隆仓库是不能直接运行的**，请下载 Releases 里的完整压缩包。
+> 仓库只存放文本配置与脚本，不包含 `mpv.exe`、`ffmpeg`、VapourSynth CUDA 运行库、Whisper 模型等大文件。**只克隆仓库是不能直接运行的**，请下载 Releases 里的完整压缩包。
 
 ---
 
@@ -51,7 +53,7 @@
 | 直播进度同步 | `F5` | 重新对齐直播实时边缘 |
 | 刷新当前媒体 | `Ctrl+F5` | 直播断流或换线后重新加载 |
 | 收藏/播放列表切换 | `[` / `]` | 上一个 / 下一个文件或收藏 |
-| 浏览器「在 mpv 播放」 | 见教程 | 油猴脚本 + 本地桥，把解析出的直链投递到新 mpv 窗口，并自动带弹幕 |
+| 浏览器「在 mpv 播放」 | [见教程](docs/使用教程.md#4-浏览器在-mpv-播放可选) | 油猴脚本 + 本地桥，把解析出的直链投递到新 mpv 窗口，并自动带弹幕 |
 
 ### YouTube 与其他网页视频
 
@@ -81,7 +83,7 @@
 
 ### 1. 下载分卷并解压
 
-完整包约 5 GB，受 GitHub 单文件 2 GiB 限制，Release 里拆成了多个分卷（数量以 Release 页面为准）：
+完整包约 3.4 GB，受 GitHub 单文件 2 GiB 限制，Release 里拆成了多个分卷（数量以 Release 页面为准）：
 
 ```
 mpv-rukalazy-v1.0.0.7z.001
@@ -214,8 +216,24 @@ mpv-rukalazy/
 │  ├─ scripts/                         # Lua 脚本（B 站、字幕、直播、截取等）
 │  ├─ tools/                           # Python/PS 辅助工具、浏览器桥、油猴脚本
 │  └─ _cache/                          # 运行时缓存（可随时删除）
-└─ installer/                          # 文件关联、测试模式、协议注册等
+├─ installer/                          # 文件关联、测试模式、协议注册等
+└─ _backup/                            # 配置备份（backup-config.bat 生成）
 ```
+
+---
+
+## 更新与备份
+
+**改配置前、更新前，先双击 `installer\backup-config.bat`**：它会把 `mpv.conf`、`script-opts.conf`、`input_uosc.conf`、`menu.conf`、`profiles.conf`、`saved-props.json`、`live-favorites.json` 和弹幕设置按时间戳备份到 `_backup\config-<时间>\`，需要时按原路径拷回即可。
+
+更新有两种方式：
+
+| 方式 | 适用 | 做法 |
+| --- | --- | --- |
+| 完整包（推荐） | 换了 mpv、滤镜、着色器等大件 | 下载新版分卷 → 解压到新目录 → 拷入备份的配置 |
+| 仓库源码覆盖 | 只更新脚本/配置，不想重下 3.4 GB | 下载仓库 ZIP → 覆盖 `portable_config/` 等功能目录（[教程](docs/使用教程.md#用仓库源码覆盖更新不重下完整包)） |
+
+yt-dlp 单独更新：`yt-dlp.exe -U`。
 
 ---
 
@@ -242,8 +260,11 @@ mpv-rukalazy/
 **Q：移动了文件夹之后浏览器投递/文件关联失效？**
 重新运行 `installer/mpv-register.bat` 与 `portable_config/tools/install_bridge_scheme.ps1`（注册信息里记的是绝对路径）。
 
-**Q：更新了新功能，必须重下 3.4 GB 的完整包吗？**
-不必。只改脚本/配置时，可以先运行 `installer/backup-config.bat` 备份个人配置，再下载仓库源码覆盖 `portable_config/`，详见 [教程 · 用仓库源码覆盖更新](docs/使用教程.md#用仓库源码覆盖更新不重下完整包)。
+**Q：更新或覆盖配置后，弹幕/字幕/界面不正常？**
+先删 `portable_config\_cache\` 和 `portable_config\cache\` 让脚本重建缓存；仍异常就从 `_backup\config-<时间>\portable_config\` 把备份的配置文件拷回原路径。
+
+**Q：杀毒软件报毒 / 文件被隔离？**
+`yt-dlp.exe`、`mpv-cookie-bridge.exe`、`deno.exe` 都是开源工具，可能被杀软启发式误报。加入信任目录后重新解压对应文件即可。
 
 ---
 

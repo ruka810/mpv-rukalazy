@@ -148,6 +148,12 @@ local function mouse_single_click()
 	mouse_click_timer = mp.add_timeout(mouse_click_delay, function()
 		mouse_click_timer = nil
 		if is_live_playback() then return end
+		if mp.get_property_bool("eof-reached", false) then
+			-- 播放结束后左键单击：从头重新播放
+			mp.commandv("seek", "0", "absolute")
+			mp.set_property_bool("pause", false)
+			return
+		end
 		mp.commandv("cycle", "pause")
 	end)
 end
